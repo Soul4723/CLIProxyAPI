@@ -226,3 +226,53 @@ func TestStreamPayloadIsQuotaFailure(t *testing.T) {
 		}
 	}
 }
+
+// An executor can coalesce several SSE events into one chunk. When the usage
+// limit replaces the quota event, the other events in that chunk are kept.
+func TestStreamUsageLimitKeepsOutputCoalescedWithQuotaFrame(t *testing.T) {
+	delta := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"LAST_REAL_OUTPUT\"}\n\n"
+	payload := delta + "event: error\ndata: " + codexDuplexQuotaFrame + "\n\n"
+	m, model, _ := newStreamQuotaManager(t, "usage-limit", &streamQuotaExecutor{frames: []string{payload}, err: poolQuotaErr{}}, 1)
+	outcome := drainStream(t, m, model)
+	if !IsUsageLimitReachedError(outcome.err) {
+		t.Fatalf("stream error = %v, want a usage-limit cooldown", outcome.err)
+	}
+	if len(outcome.payloads) != 2 || outcome.payloads[1] != delta {
+		t.Fatalf("payloads = %q, want response.created then only the output delta", outcome.payloads)
+	}
+}
+
+// A held quota frame that is not followed by an error chunk is sent unchanged,
+// in order.
+func TestStreamUsageLimitFlushesHeldFrameWithoutError(t *testing.T) {
+	success := `{"type":"response.completed","response":{"id":"resp_1","output":[]}}`
+	m, model, _ := newStreamQuotaManager(t, "usage-limit", &streamQuotaExecutor{frames: []string{codexDuplexQuotaFrame, success}}, 1)
+	outcome := drainStream(t, m, model)
+	if outcome.err != nil || len(outcome.payloads) != 3 || outcome.payloads[1] != codexDuplexQuotaFrame || outcome.payloads[2] != success {
+		t.Fatalf("outcome = %+v, want response.created, the frame, then response.completed", outcome)
+	}
+}
+
+// Canceling the request while a frame is held closes the stream.
+func TestStreamUsageLimitClosesOnCancelWhileHolding(t *testing.T) {
+	executor := &streamQuotaExecutor{frames: []string{codexDuplexQuotaFrame}, release: make(chan struct{})}
+	m, model, _ := newStreamQuotaManager(t, "usage-limit", executor, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result, err := m.ExecuteStream(ctx, []string{streamQuotaProvider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	<-result.Chunks
+	cancel()
+	for {
+		select {
+		case _, ok := <-result.Chunks:
+			if !ok {
+				return
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("stream did not close on cancellation")
+		}
+	}
+}
