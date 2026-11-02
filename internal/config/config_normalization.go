@@ -581,18 +581,23 @@ func NormalizeExcludedModels(models []string) []string {
 }
 
 // NormalizeOAuthExcludedModels cleans provider -> excluded models mappings by normalizing provider keys
-// and applying model exclusion normalization to each entry.
+// and merging model exclusions in sorted provider-key order, preserving first occurrences.
 func NormalizeOAuthExcludedModels(entries map[string][]string) map[string][]string {
 	if len(entries) == 0 {
 		return nil
 	}
 	out := make(map[string][]string, len(entries))
-	for provider, models := range entries {
+	providers := make([]string, 0, len(entries))
+	for provider := range entries {
+		providers = append(providers, provider)
+	}
+	sort.Strings(providers)
+	for _, provider := range providers {
 		key := strings.ToLower(strings.TrimSpace(provider))
 		if key == "" {
 			continue
 		}
-		normalized := NormalizeExcludedModels(models)
+		normalized := NormalizeExcludedModels(append(out[key], entries[provider]...))
 		if len(normalized) == 0 {
 			continue
 		}
