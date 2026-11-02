@@ -1,0 +1,37 @@
+# Fork-only verification harness (Soul4723/CLIProxyAPI). Never merged into contrib/main/dev.
+# Copied onto ci/verify-* branches (PR head + this file) to run the full test suite,
+# which upstream's pr-test-build does not do.
+name: fork-verify
+
+on:
+  push:
+    branches:
+      - 'ci/verify-**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Refresh models catalog
+        run: bash .github/scripts/refresh-model-catalogs.sh
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -count=1 ./... 2>&1 | tee go-test.log
+        shell: bash -o pipefail {0}
+      - name: Failed tests summary
+        if: always()
+        run: |
+          { echo '## go test'; echo '```'; grep -E '^(--- FAIL|FAIL|ok|panic)' go-test.log | head -200 || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
