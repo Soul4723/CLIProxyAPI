@@ -7,6 +7,7 @@ import (
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
@@ -91,4 +92,64 @@ func TestUsageLimitModeAliasPoolWithAvailableBackendStaysRetryable(t *testing.T)
 			}
 		}
 	}
+}
+
+type usageLimitNoopExecutor struct{ id string }
+
+func (e usageLimitNoopExecutor) Identifier() string { return e.id }
+func (usageLimitNoopExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+func (usageLimitNoopExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+func (usageLimitNoopExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) { return auth, nil }
+func (usageLimitNoopExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+func (usageLimitNoopExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+// Only credentials selection could run count: one whose provider has no
+// executor cannot serve the request and must not block the usage limit.
+func TestUsageLimitPoolIgnoresCredentialsWithoutExecutor(t *testing.T) {
+	const model = "usage-limit-mixed-model"
+	now := time.Now()
+	for _, tc := range []struct {
+		name          string
+		otherExecutor bool
+		want          bool
+	}{
+		{name: "other provider has no executor", otherExecutor: false, want: true},
+		{name: "other provider can serve", otherExecutor: true, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewManager(nil, nil, nil)
+			m.RegisterExecutor(usageLimitNoopExecutor{id: "quota-a"})
+			if tc.otherExecutor {
+				m.RegisterExecutor(usageLimitNoopExecutor{id: "quota-b"})
+			}
+			exhausted := credentialQuotaAuth("mixed-a-"+tc.name, true, now.Add(2*time.Hour), 300)
+			exhausted.Provider = "quota-a"
+			available := &Auth{ID: "mixed-b-" + tc.name, Provider: "quota-b", Status: StatusActive}
+			for _, auth := range []*Auth{exhausted, available} {
+				if _, err := m.Register(WithSkipPersist(context.Background()), auth); err != nil {
+					t.Fatal(err)
+				}
+				registryRegister(t, auth.ID, auth.Provider, model)
+			}
+			refusal := m.usageLimitRefusalForPool([]string{"quota-a", "Quota-B"}, model, authSelectionEligibility{}, "", now)
+			if (refusal != nil) != tc.want {
+				t.Fatalf("refusal = %+v, want usage limit %t", refusal, tc.want)
+			}
+		})
+	}
+}
+
+func registryRegister(t *testing.T, authID, provider, model string) {
+	t.Helper()
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(authID) })
 }

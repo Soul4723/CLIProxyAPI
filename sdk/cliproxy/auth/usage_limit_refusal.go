@@ -233,9 +233,11 @@ func (m *Manager) usageLimitRefusalForPool(providers []string, model string, eli
 	if m == nil || len(providers) == 0 {
 		return nil
 	}
+	// The candidate filters mirror pickNextMixedLegacy, so the pool is the set
+	// of credentials selection could offer for this request.
 	providerSet := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
-		if key := strings.TrimSpace(strings.ToLower(provider)); key != "" {
+		if key := canonicalSchedulingProvider(provider); key != "" {
 			providerSet[key] = struct{}{}
 		}
 	}
@@ -244,7 +246,7 @@ func (m *Manager) usageLimitRefusalForPool(providers []string, model string, eli
 	defer m.mu.RUnlock()
 	candidates := make([]*Auth, 0, len(m.auths))
 	for _, auth := range m.auths {
-		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+		if auth == nil || auth.Disabled {
 			continue
 		}
 		if pinnedAuthID != "" && auth.ID != pinnedAuthID {
@@ -253,10 +255,17 @@ func (m *Manager) usageLimitRefusalForPool(providers []string, model string, eli
 		if !eligibility.allows(auth) {
 			continue
 		}
-		if _, ok := providerSet[executorKeyFromAuth(auth)]; !ok {
+		providerKey := executorKeyFromAuth(auth)
+		if providerKey == "" {
 			continue
 		}
-		if model != "" && !m.authSupportsRouteModel(registryRef, auth, model) {
+		if _, ok := providerSet[providerKey]; !ok {
+			continue
+		}
+		if _, ok := m.executorLocked(providerKey); !ok {
+			continue
+		}
+		if strings.TrimSpace(model) != "" && !m.authSupportsRouteModel(registryRef, auth, model) {
 			continue
 		}
 		candidates = append(candidates, auth)
