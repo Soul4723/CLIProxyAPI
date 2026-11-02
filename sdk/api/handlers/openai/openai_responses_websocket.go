@@ -392,7 +392,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	wsDone := make(chan struct{})
 	defer close(wsDone)
 	var codexDuplexStream atomic.Bool
-	var activeTurn responsesWebsocketTurnTracker
 
 	if h != nil && h.AuthManager != nil {
 		type upstreamDisconnectSubscriber interface {
@@ -416,19 +415,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 								// drain its acknowledgements and pending events in order.
 								// OAuth-only steering still leaves API keys in normal mode.
 								return
-							}
-							if disconnectAwaitsTurnTerminal(disconnectErr) {
-								// The running turn reports the same failure through its
-								// stream, where the usage-limit response mode may turn it
-								// into an error event. Closing here first would drop that
-								// event, so the turn's terminal handling closes instead.
-								// The wait ends early when the socket is canceled, and
-								// after a grace period when the turn cannot finish (for
-								// example while a client that stopped reading blocks a
-								// write); the close below then releases the writer.
-								if !activeTurn.wait(wsDone, socketCtx.Done(), responsesWebsocketUsageLimitDisconnectGrace) {
-									return
-								}
 							}
 							writer.closeForUpstreamDisconnect(disconnectErr)
 						}
@@ -906,7 +892,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		if executionAuthID != "" && !isPluginExecutorRoute {
 			cliCtx = handlers.WithPinnedAuthID(cliCtx, executionAuthID)
 		}
-		endTurn := activeTurn.begin()
 		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
 		if !selectedAuthObserved {
 			// Plugin/alternate routes bypass auth selection. Keep canonical HTTP-mode
@@ -956,7 +941,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				},
 			},
 		)
-		endTurn()
 		if errForward != nil {
 			wsTerminateErr = errForward
 			switch {
@@ -1160,78 +1144,4 @@ func writeResponsesWebsocketPreviousResponseNotFound(writer *responsesWebsocketW
 		errorPayload, _ = ojson.SetBytes(errorPayload, "error.event_id", eventID)
 	}
 	return writeResponsesWebsocketPayload(writer, wsTimelineLog, errorPayload, time.Now())
-}
-
-// responsesWebsocketTurnTracker records whether a turn is executing, so an
-// upstream disconnect notification can wait for the turn's own terminal
-// handling instead of racing it.
-type responsesWebsocketTurnTracker struct {
-	mu   sync.Mutex
-	done chan struct{}
-}
-
-// begin marks a turn as running and returns the function that ends it.
-func (t *responsesWebsocketTurnTracker) begin() func() {
-	done := make(chan struct{})
-	t.mu.Lock()
-	t.done = done
-	t.mu.Unlock()
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			t.mu.Lock()
-			if t.done == done {
-				t.done = nil
-			}
-			t.mu.Unlock()
-			close(done)
-		})
-	}
-}
-
-// responsesWebsocketUsageLimitDisconnectGrace bounds how long a quota
-// disconnect defers closing the socket to the running turn. A turn whose
-// terminal event is ready finishes in milliseconds; one that is still blocked
-// after this long cannot deliver the event, and the socket is closed as it is
-// without the wait.
-var responsesWebsocketUsageLimitDisconnectGrace = 5 * time.Second
-
-// wait blocks until the running turn, if any, has ended, canceled is closed, or
-// grace has passed. It reports false when the connection finished first.
-func (t *responsesWebsocketTurnTracker) wait(connectionDone, canceled <-chan struct{}, grace time.Duration) bool {
-	t.mu.Lock()
-	done := t.done
-	t.mu.Unlock()
-	if done == nil {
-		return true
-	}
-	timer := time.NewTimer(grace)
-	defer timer.Stop()
-	select {
-	case <-done:
-		return true
-	case <-canceled:
-		return true
-	case <-timer.C:
-		return true
-	case <-connectionDone:
-		return false
-	}
-}
-
-// disconnectAwaitsTurnTerminal reports whether an upstream disconnect must
-// leave closing the socket to the running turn: in the usage-limit response
-// mode, when the upstream ended the connection with explicit quota exhaustion.
-// Every other disconnect, and every disconnect in the retryable mode, still
-// closes the socket at once.
-func disconnectAwaitsTurnTerminal(err error) bool {
-	if err == nil || !coreauth.QuotaCooldownUsageLimitModeEnabled() {
-		return false
-	}
-	var quota cliproxyexecutor.QuotaExhaustedError
-	if !errors.As(err, &quota) || quota == nil || !quota.IsQuotaExhausted() {
-		return false
-	}
-	var status interface{ StatusCode() int }
-	return errors.As(err, &status) && status != nil && status.StatusCode() == http.StatusTooManyRequests
 }

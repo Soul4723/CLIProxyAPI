@@ -3,11 +3,11 @@ package openai
 import (
 	"context"
 	"errors"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -124,20 +124,22 @@ func runRealCodexWebsocketTurnWithClose(t *testing.T, mode string, steering bool
 	}
 }
 
-// With steering off, the Codex executor also reports the failure on its
-// upstream disconnect channel, whose subscriber used to close the socket
-// before the stream's normalised error arrived. The usage-limit event must
-// reach the client before the close, exactly once, for both quota frame
-// shapes the executor accepts.
-func TestRealCodexWebsocketUsageLimitBeatsDisconnectClose(t *testing.T) {
-	for name, failure := range map[string]string{"direct": codexQuotaFrameDirect, "wrapped": codexQuotaFrameWrapped} {
-		t.Run(name, func(t *testing.T) {
-			frames := runRealCodexWebsocketTurn(t, "usage-limit", false, failure)
-			if len(frames) != 1 {
-				t.Fatalf("terminal frames = %d (%q), want exactly one usage-limit event", len(frames), frames)
-			}
-			assertCodexWebsocketUsageLimit(t, frames[0])
-		})
+// With steering off, the Codex executor reports a quota failure after
+// response.created on its upstream disconnect channel, and the socket closes at
+// once without an event (1006), in both modes, as on base. The usage limit
+// reaches the client on its next request instead; see
+// TestRealCodexWebsocketQuotaReachesClientOnReconnect.
+func TestRealCodexWebsocketMidStreamQuotaClosesSilently(t *testing.T) {
+	for _, mode := range []string{"retryable", "usage-limit"} {
+		for name, failure := range map[string]string{"direct": codexQuotaFrameDirect, "wrapped": codexQuotaFrameWrapped} {
+			t.Run(mode+"/"+name, func(t *testing.T) {
+				frames, closeErr := runRealCodexWebsocketTurnWithClose(t, mode, false, failure)
+				if len(frames) != 0 {
+					t.Fatalf("frames = %q, want a silent close", frames)
+				}
+				assertAbnormalClose(t, closeErr)
+			})
+		}
 	}
 }
 
@@ -304,11 +306,7 @@ type blockedTurn struct {
 	client      *websocket.Conn
 	handlerDone chan struct{}
 	failureSent chan struct{}
-	// upstreamGone closes when the executor has closed the upstream after the
-	// failure, so its disconnect notification has been posted.
-	upstreamGone chan struct{}
-	cancel       context.CancelFunc
-	bigFrame     int
+	bigFrame    int
 }
 
 func startRealCodexBlockedTurn(t *testing.T, mode string) *blockedTurn {
@@ -317,7 +315,7 @@ func startRealCodexBlockedTurn(t *testing.T, mode string) *blockedTurn {
 	coreauth.SetQuotaCooldownResponseMode(mode)
 	t.Cleanup(func() { coreauth.SetQuotaCooldownResponseMode("") })
 
-	turn := &blockedTurn{handlerDone: make(chan struct{}), failureSent: make(chan struct{}), upstreamGone: make(chan struct{}), bigFrame: 16 << 20}
+	turn := &blockedTurn{handlerDone: make(chan struct{}), failureSent: make(chan struct{}), bigFrame: 16 << 20}
 	delta := `{"type":"response.output_text.delta","delta":"` + strings.Repeat("x", turn.bigFrame) + `"}`
 	releaseOutput := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -338,7 +336,6 @@ func startRealCodexBlockedTurn(t *testing.T, mode string) *blockedTurn {
 		close(turn.failureSent)
 		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 		_, _, _ = conn.ReadMessage()
-		close(turn.upstreamGone)
 	}))
 
 	cfg := &config.Config{}
@@ -360,13 +357,8 @@ func startRealCodexBlockedTurn(t *testing.T, mode string) *blockedTurn {
 
 	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&cfg.SDKConfig, manager))
 	router := gin.New()
-	cancels := make(chan context.CancelFunc, 1)
 	router.GET("/v1/responses", func(c *gin.Context) {
 		defer close(turn.handlerDone)
-		ctx, cancel := context.WithCancel(c.Request.Context())
-		defer cancel()
-		cancels <- cancel
-		c.Request = c.Request.WithContext(ctx)
 		h.ResponsesWebsocket(c)
 	})
 	downstream := httptest.NewServer(router)
@@ -376,7 +368,6 @@ func startRealCodexBlockedTurn(t *testing.T, mode string) *blockedTurn {
 		t.Fatalf("dial websocket: %v", errDial)
 	}
 	turn.client = client
-	turn.cancel = <-cancels
 	// Cleanups run last-in first-out: the client closes before the servers,
 	// so a blocked handler can always finish and the servers can shut down.
 	t.Cleanup(upstream.Close)
@@ -397,39 +388,6 @@ func startRealCodexBlockedTurn(t *testing.T, mode string) *blockedTurn {
 	return turn
 }
 
-// blockClient reads the start of the large frame, so the handler is inside its
-// write, then stops reading so that write cannot finish. It returns once the
-// executor has seen the quota failure and closed the upstream, which posts its
-// disconnect notification.
-func (b *blockedTurn) blockClient(t *testing.T) {
-	t.Helper()
-	_ = b.client.SetReadDeadline(time.Now().Add(10 * time.Second))
-	_, reader, errNext := b.client.NextReader()
-	if errNext != nil {
-		t.Fatalf("start reading the large frame: %v", errNext)
-	}
-	head := make([]byte, 1024)
-	if _, errRead := io.ReadFull(reader, head); errRead != nil {
-		t.Fatalf("read the start of the large frame: %v", errRead)
-	}
-	if !strings.HasPrefix(string(head), `{"type":"response.output_text.delta"`) {
-		t.Fatalf("frame after response.created starts %q, want the large delta", head[:64])
-	}
-	for _, step := range []struct {
-		done <-chan struct{}
-		what string
-	}{{b.failureSent, "send the quota failure"}, {b.upstreamGone, "see the upstream close"}} {
-		select {
-		case <-step.done:
-		case <-time.After(10 * time.Second):
-			t.Fatalf("upstream did not %s", step.what)
-		}
-	}
-	if b.handlerExitsWithin(0) {
-		t.Fatal("handler exited although the client is blocking its write")
-	}
-}
-
 func (b *blockedTurn) handlerExitsWithin(limit time.Duration) bool {
 	select {
 	case <-b.handlerDone:
@@ -439,76 +397,34 @@ func (b *blockedTurn) handlerExitsWithin(limit time.Duration) bool {
 	}
 }
 
-// A client that stops reading during a large frame blocks the downstream
-// write. When the upstream then fails with exhausted quota, the handler must
-// still finish: at once when the request is canceled, and within a bounded
-// time when nothing cancels it. Retryable mode closes at once, as before.
+// A client that stops reading during a large frame must not keep the handler
+// alive when the upstream then fails with exhausted quota: in both modes the
+// socket closes at once, as on base, and the handler exits.
 func TestRealCodexWebsocketBlockedClientDoesNotHangHandler(t *testing.T) {
-	t.Run("usage-limit/request-canceled", func(t *testing.T) {
-		turn := startRealCodexBlockedTurn(t, "usage-limit")
-		turn.blockClient(t)
-		turn.cancel()
-		if !turn.handlerExitsWithin(3 * time.Second) {
-			t.Fatal("handler still blocked 3s after the request was canceled")
-		}
-	})
-	t.Run("usage-limit/upstream-disconnect", func(t *testing.T) {
-		turn := startRealCodexBlockedTurn(t, "usage-limit")
-		turn.blockClient(t)
-		if !turn.handlerExitsWithin(15 * time.Second) {
-			t.Fatal("handler still blocked 15s after the upstream failed")
-		}
-	})
-	t.Run("retryable/upstream-disconnect", func(t *testing.T) {
-		// Retryable mode closes the socket as soon as the upstream fails, as
-		// on base, so the client cannot block the handler at all.
-		turn := startRealCodexBlockedTurn(t, "retryable")
-		select {
-		case <-turn.failureSent:
-		case <-time.After(10 * time.Second):
-			t.Fatal("upstream did not send the quota failure")
-		}
-		if !turn.handlerExitsWithin(3 * time.Second) {
-			t.Fatal("handler still blocked 3s after the upstream failed")
-		}
-		_ = turn.client.SetReadDeadline(time.Now().Add(5 * time.Second))
-		for {
-			_, payload, errRead := turn.client.ReadMessage()
-			if errRead != nil {
-				assertAbnormalClose(t, errRead)
-				return
+	for _, mode := range []string{"retryable", "usage-limit"} {
+		t.Run(mode, func(t *testing.T) {
+			turn := startRealCodexBlockedTurn(t, mode)
+			select {
+			case <-turn.failureSent:
+			case <-time.After(10 * time.Second):
+				t.Fatal("upstream did not send the quota failure")
 			}
-			if got := ojson.GetBytes(payload, "type").String(); got != "response.output_text.delta" {
-				t.Fatalf("frame type = %q, want only output before the silent close", got)
+			if !turn.handlerExitsWithin(3 * time.Second) {
+				t.Fatal("handler still blocked 3s after the upstream failed")
 			}
-		}
-	})
-}
-
-// A client that keeps reading gets the large frame and then exactly one
-// usage-limit event.
-func TestRealCodexWebsocketReadingClientGetsUsageLimitAfterLargeFrame(t *testing.T) {
-	turn := startRealCodexBlockedTurn(t, "usage-limit")
-	_ = turn.client.SetReadDeadline(time.Now().Add(15 * time.Second))
-	_, big, errRead := turn.client.ReadMessage()
-	if errRead != nil {
-		t.Fatalf("read large frame: %v", errRead)
+			_ = turn.client.SetReadDeadline(time.Now().Add(5 * time.Second))
+			for {
+				_, payload, errRead := turn.client.ReadMessage()
+				if errRead != nil {
+					assertAbnormalClose(t, errRead)
+					return
+				}
+				if got := ojson.GetBytes(payload, "type").String(); got != "response.output_text.delta" {
+					t.Fatalf("frame type = %q, want only output before the silent close", got)
+				}
+			}
+		})
 	}
-	if len(big) < turn.bigFrame || ojson.GetBytes(big, "type").String() != "response.output_text.delta" {
-		t.Fatalf("first frame after response.created is %d bytes of type %q, want the large delta", len(big), ojson.GetBytes(big, "type").String())
-	}
-	var frames []string
-	for {
-		_, payload, errNext := turn.client.ReadMessage()
-		if errNext != nil {
-			break
-		}
-		frames = append(frames, string(payload))
-	}
-	if len(frames) != 1 {
-		t.Fatalf("terminal frames = %d (%q), want exactly one usage-limit event", len(frames), frames)
-	}
-	assertCodexWebsocketUsageLimit(t, frames[0])
 }
 
 // assertAbnormalClose checks that the socket closed without a close frame
@@ -518,5 +434,136 @@ func assertAbnormalClose(t *testing.T, err error) {
 	var closeErr *websocket.CloseError
 	if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseAbnormalClosure {
 		t.Fatalf("close = %v, want 1006 (abnormal closure)", err)
+	}
+}
+
+// A quota failure mid-stream closes the socket silently. Codex then reconnects,
+// and its next request finds every credential cooling with quota evidence, so
+// it gets exactly one usage-limit event, with the reset and the x-codex window
+// headers, before the socket closes. The upstream is not contacted again.
+func TestRealCodexWebsocketQuotaReachesClientOnReconnect(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	coreauth.SetQuotaCooldownResponseMode("usage-limit")
+	t.Cleanup(func() { coreauth.SetQuotaCooldownResponseMode("") })
+
+	failure := `{"type":"error","status":429,"headers":{"x-codex-primary-used-percent":"100","x-codex-primary-window-minutes":"300"},"error":{"type":"usage_limit_reached","message":"quota","resets_in_seconds":7200}}`
+	var upstreamConnections atomic.Int32
+	releaseFailure := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamConnections.Add(1)
+		conn, errUpgrade := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upstream upgrade: %v", errUpgrade)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("upstream read create: %v", errRead)
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"r1","output":[]}}`))
+		<-releaseFailure
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(failure))
+		_, _, _ = conn.ReadMessage()
+	}))
+	t.Cleanup(upstream.Close)
+
+	cfg := &config.Config{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(cfg)
+	manager.RegisterExecutor(runtimeexecutor.NewCodexAutoExecutor(cfg))
+	model := "usage-limit-codex-ws-" + uuid.NewString()
+	authID := model + "-auth"
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+		ID:         authID,
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"base_url": upstream.URL, "websockets": "true"},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&cfg.SDKConfig, manager))
+	router := gin.New()
+	router.GET("/v1/responses", h.ResponsesWebsocket)
+	downstream := httptest.NewServer(router)
+	t.Cleanup(downstream.Close)
+	wsURL := "ws" + strings.TrimPrefix(downstream.URL, "http") + "/v1/responses"
+	create := []byte(`{"type":"response.create","model":"` + model + `","input":[]}`)
+
+	// First connection: output starts, then the quota failure closes it.
+	first, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	defer func() { _ = first.Close() }()
+	_ = first.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if errWrite := first.WriteMessage(websocket.TextMessage, create); errWrite != nil {
+		t.Fatalf("write create: %v", errWrite)
+	}
+	if _, payload, errRead := first.ReadMessage(); errRead != nil || ojson.GetBytes(payload, "type").String() != "response.created" {
+		t.Fatalf("read response.created: %s, %v", payload, errRead)
+	}
+	close(releaseFailure)
+	_, payload, errRead := first.ReadMessage()
+	if errRead == nil {
+		t.Fatalf("first connection got %s after the quota failure, want a silent close", payload)
+	}
+	assertAbnormalClose(t, errRead)
+
+	// The failure is recorded by the stream's result tracking; wait until the
+	// credential is cooling before reconnecting, as a reconnect would find it.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if auth, ok := manager.GetByID(authID); ok && auth.Quota.Exceeded {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("credential was not marked as cooling after the quota failure")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Reconnect: the next request gets the usage limit.
+	second, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("redial websocket: %v", errDial)
+	}
+	defer func() { _ = second.Close() }()
+	_ = second.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if errWrite := second.WriteMessage(websocket.TextMessage, create); errWrite != nil {
+		t.Fatalf("write second create: %v", errWrite)
+	}
+	var frames []string
+	for {
+		_, next, errNext := second.ReadMessage()
+		if errNext != nil {
+			break
+		}
+		frames = append(frames, string(next))
+	}
+	if len(frames) != 1 {
+		t.Fatalf("reconnect frames = %d (%q), want exactly one usage-limit event", len(frames), frames)
+	}
+	assertCodexWebsocketUsageLimit(t, frames[0])
+	headers := ojson.Get(frames[0], "headers")
+	if got := headers.Get("X-Codex-Primary-Used-Percent").String(); got != "100" {
+		t.Fatalf("headers.X-Codex-Primary-Used-Percent = %q, want 100: %s", got, frames[0])
+	}
+	if got := headers.Get("X-Codex-Primary-Window-Minutes").String(); got != "300" {
+		t.Fatalf("headers.X-Codex-Primary-Window-Minutes = %q, want 300: %s", got, frames[0])
+	}
+	wantReset := time.Now().Add(2 * time.Hour).Unix()
+	if got := headers.Get("X-Codex-Primary-Reset-At").Int(); got < wantReset-5 || got > wantReset+5 {
+		t.Fatalf("headers.X-Codex-Primary-Reset-At = %d, want about %d: %s", got, wantReset, frames[0])
+	}
+	if headers.Get("Retry-After").Exists() {
+		t.Fatalf("headers.Retry-After is set: %s", frames[0])
+	}
+	if got := upstreamConnections.Load(); got != 1 {
+		t.Fatalf("upstream connections = %d, want 1: the reconnect must not reach the upstream", got)
 	}
 }
