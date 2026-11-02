@@ -355,6 +355,7 @@ func newAntigravityStatusErr(statusCode int, body []byte) statusErr {
 		if retryAfter, parseErr := helps.ParseRetryDelay(body); parseErr == nil && retryAfter != nil {
 			err.retryAfter = retryAfter
 		}
+		err.quotaExhausted = helps.GoogleBodyIndicatesQuotaExhausted(body)
 	}
 	return err
 }

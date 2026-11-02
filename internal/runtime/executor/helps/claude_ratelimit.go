@@ -138,16 +138,25 @@ var claudeQuotaStatusHeaders = []string{
 // Retry-After is a single unambiguous value usable by the downstream deadline
 // filter. Every other input keeps the conservative header-only result.
 func ParseClaudeRateLimitResetForError(headers http.Header, body []byte, now time.Time) *time.Duration {
+	reset, _ := ParseClaudeRateLimitResetAndWindowForError(headers, body, now)
+	return reset
+}
+
+// ParseClaudeRateLimitResetAndWindowForError is ParseClaudeRateLimitResetForError
+// that also reports the length, in minutes, of the rejected unified window
+// whose reset is the deadline it keeps: 300 for the 5-hour window, 10080 for
+// the weekly one. The window is 0 when the kept deadline matches neither.
+func ParseClaudeRateLimitResetAndWindowForError(headers http.Header, body []byte, now time.Time) (*time.Duration, int64) {
 	if headers == nil || !claudeBodyIsExplicitPerMinuteRateLimit(body) || claudeHeadersHaveQuotaStatus(headers) {
-		return ParseClaudeRateLimitReset(headers, now)
+		return parseClaudeRateLimitResetAndWindowWithFuzz(headers, now, defaultClaudeRateLimitFuzzMinSeconds, defaultClaudeRateLimitFuzzMaxSeconds)
 	}
 	rawRetryAfter, ok := singleHeaderValueCaseInsensitive(headers, "Retry-After")
 	if !ok {
-		return ParseClaudeRateLimitReset(headers, now)
+		return parseClaudeRateLimitResetAndWindowWithFuzz(headers, now, defaultClaudeRateLimitFuzzMinSeconds, defaultClaudeRateLimitFuzzMaxSeconds)
 	}
 	retryAt, okRetry := parseRetryAfterHeader(rawRetryAfter, now)
 	if !okRetry || !retryAt.After(now) || retryAt.Sub(now) > maxClaudeRateLimitWindow {
-		return ParseClaudeRateLimitReset(headers, now)
+		return parseClaudeRateLimitResetAndWindowWithFuzz(headers, now, defaultClaudeRateLimitFuzzMinSeconds, defaultClaudeRateLimitFuzzMaxSeconds)
 	}
 	// Only the unclassified unified reset can stretch the cooldown here: every
 	// window-specific reset is consulted solely when its window is rejected.
@@ -157,7 +166,7 @@ func ParseClaudeRateLimitResetForError(headers http.Header, body []byte, now tim
 			delete(rateHeaders, name)
 		}
 	}
-	return ParseClaudeRateLimitReset(rateHeaders, now)
+	return parseClaudeRateLimitResetAndWindowWithFuzz(rateHeaders, now, defaultClaudeRateLimitFuzzMinSeconds, defaultClaudeRateLimitFuzzMaxSeconds)
 }
 
 // claudeBodyIsExplicitPerMinuteRateLimit reports whether body is exactly one of the
@@ -228,8 +237,13 @@ func ParseClaudeRateLimitReset(headers http.Header, now time.Time) *time.Duratio
 }
 
 func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFuzzSec, maxFuzzSec int) *time.Duration {
+	reset, _ := parseClaudeRateLimitResetAndWindowWithFuzz(headers, now, minFuzzSec, maxFuzzSec)
+	return reset
+}
+
+func parseClaudeRateLimitResetAndWindowWithFuzz(headers http.Header, now time.Time, minFuzzSec, maxFuzzSec int) (*time.Duration, int64) {
 	if headers == nil {
-		return nil
+		return nil, 0
 	}
 
 	unifiedStatus := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-Status")))
@@ -240,6 +254,9 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 
 	var candidateDeadlines []time.Time
 	var rejectedWindows []string
+	// Resets of the rejected 5-hour and weekly windows, to name the window
+	// whose reset is the deadline finally kept.
+	var reset5h, reset7d time.Time
 
 	if unifiedStatus == "rejected" {
 		rejectedWindows = append(rejectedWindows, "unified")
@@ -271,6 +288,7 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 		if raw := getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-5h-Reset"); raw != "" {
 			if t, ok := parseUnixOrTimestamp(raw); ok && t.After(now) {
 				candidateDeadlines = append(candidateDeadlines, t)
+				reset5h = t
 			}
 		}
 	}
@@ -280,6 +298,7 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 		if raw := getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d-Reset"); raw != "" {
 			if t, ok := parseUnixOrTimestamp(raw); ok && t.After(now) {
 				candidateDeadlines = append(candidateDeadlines, t)
+				reset7d = t
 			}
 		}
 	}
@@ -321,7 +340,7 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 				"status":           "fallback_exponential_backoff",
 			}).Info("Anthropic rate limit window rejected; falling back to generic exponential backoff")
 		}
-		return nil
+		return nil, 0
 	}
 
 	// Pick the latest applicable deadline across rejected windows
@@ -339,7 +358,15 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 				"status":           "fallback_exponential_backoff",
 			}).Info("Anthropic rate limit window rejected; falling back to generic exponential backoff")
 		}
-		return nil
+		return nil, 0
+	}
+
+	var windowMinutes int64
+	switch {
+	case !reset7d.IsZero() && reset7d.Equal(latestDeadline):
+		windowMinutes = claudeSevenDayWindowMinutes
+	case !reset5h.IsZero() && reset5h.Equal(latestDeadline):
+		windowMinutes = claudeFiveHourWindowMinutes
 	}
 
 	baseDuration := latestDeadline.Sub(now)
@@ -354,7 +381,7 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 		"deadline":           latestDeadline.Format(time.RFC3339),
 	}).Info("parsed Anthropic rate limit reset headers")
 
-	return &effectiveDuration
+	return &effectiveDuration, windowMinutes
 }
 
 func claudeUnifiedResetIsOverageBillingBoundary(headers http.Header, unifiedReset string) bool {

@@ -98,6 +98,14 @@ type Config struct {
 	// 0 keeps the legacy default cooldown. Negative values disable these cooldowns.
 	TransientErrorCooldownSeconds int `yaml:"transient-error-cooldown-seconds" json:"transient-error-cooldown-seconds"`
 
+	// QuotaCooldownResponseMode controls how a request is answered when every
+	// eligible credential is out of quota. "retryable" (the default when empty)
+	// keeps the retryable 429 with Retry-After. "usage-limit" answers with a
+	// final usage limit (no Retry-After, X-Should-Retry: false, absolute reset)
+	// only when every candidate carries explicit upstream quota-exhaustion
+	// evidence and the earliest reset is more than five minutes away.
+	QuotaCooldownResponseMode string `yaml:"quota-cooldown-response-mode,omitempty" json:"quota-cooldown-response-mode,omitempty"`
+
 	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh and manual refresh-all worker pool.
 	// When <= 0, the default worker count is used.
 	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`

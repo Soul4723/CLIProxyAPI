@@ -52,6 +52,10 @@ func ensureOpenAICompatUserAgent(r *http.Request, clientHeaders ...http.Header) 
 type OpenAICompatExecutor struct {
 	provider string
 	cfg      *config.Config
+	// googleQuotaEvidence also reads Google quota-exhaustion evidence from
+	// upstream errors, for delegates whose upstream is a Google API (Vertex
+	// OpenAPI).
+	googleQuotaEvidence bool
 }
 
 // NewOpenAICompatExecutor creates an executor bound to a provider key (e.g., "openrouter").
@@ -222,7 +226,7 @@ func (e *OpenAICompatExecutor) executeWithCredentials(ctx context.Context, auth 
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = newOpenAICompatStatusError(httpResp.StatusCode, httpResp.Header, b)
+		err = e.statusError(httpResp.StatusCode, httpResp.Header, b)
 		return resp, err
 	}
 	body, err := io.ReadAll(httpResp.Body)
@@ -330,7 +334,7 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), body))
-		err = newOpenAICompatStatusError(httpResp.StatusCode, httpResp.Header, body)
+		err = e.statusError(httpResp.StatusCode, httpResp.Header, body)
 		return resp, err
 	}
 
@@ -457,7 +461,7 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
 		}
-		err = newOpenAICompatStatusError(httpResp.StatusCode, httpResp.Header, b)
+		err = e.statusError(httpResp.StatusCode, httpResp.Header, b)
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -1180,6 +1184,14 @@ type statusErr struct {
 	credentialScoped   bool
 	streamTruncated    bool
 	transientRateLimit bool
+	// quotaExhausted marks a 429 the upstream explicitly identified as quota
+	// exhaustion with a structured code; quotaWindowMinutes is the length of
+	// the exhausted window when the upstream names it (0 when unknown).
+	quotaExhausted     bool
+	quotaWindowMinutes int64
+	// quotaResetAfter is the provider reset of an explicit quota exhaustion
+	// that is not also the retry hint (see cliproxyexecutor.QuotaResetError).
+	quotaResetAfter *time.Duration
 	// diagnostic is a content-free detail for logs only; it never reaches clients.
 	diagnostic string
 }
@@ -1205,14 +1217,60 @@ func (e statusErr) IsStreamTruncated() bool { return e.streamTruncated }
 // that must not be recorded as credential quota exhaustion.
 func (e statusErr) IsTransientRateLimit() bool { return e.transientRateLimit }
 
+// IsQuotaExhausted marks a 429 that the upstream explicitly identified as
+// quota exhaustion with a structured code.
+func (e statusErr) IsQuotaExhausted() bool { return e.quotaExhausted }
+
+// QuotaResetAfter reports when an explicitly exhausted quota returns, for
+// errors that carry no retry hint of their own.
+func (e statusErr) QuotaResetAfter() *time.Duration {
+	if !e.quotaExhausted {
+		return nil
+	}
+	return e.quotaResetAfter
+}
+
+// QuotaLimitWindowMinutes reports the length of the exhausted quota window
+// named by the upstream, or 0 when it is unknown.
+func (e statusErr) QuotaLimitWindowMinutes() int64 {
+	if !e.quotaExhausted {
+		return 0
+	}
+	return e.quotaWindowMinutes
+}
+
 const openAICompatTPMFallbackRetryAfter = time.Minute
 
 func newOpenAICompatStatusError(status int, headers http.Header, body []byte) statusErr {
 	return statusErr{
-		code:       status,
-		msg:        string(body),
-		retryAfter: openAICompatRetryAfter(status, headers, body, time.Now()),
+		code:           status,
+		msg:            string(body),
+		retryAfter:     openAICompatRetryAfter(status, headers, body, time.Now()),
+		quotaExhausted: status == http.StatusTooManyRequests && isOpenAIInsufficientQuotaError(body),
 	}
+}
+
+// statusError builds the error for a non-2xx upstream response. With
+// googleQuotaEvidence it adds Google quota-exhaustion evidence and its reset
+// without changing the error text or the retry hint.
+func (e *OpenAICompatExecutor) statusError(status int, headers http.Header, body []byte) statusErr {
+	err := newOpenAICompatStatusError(status, headers, body)
+	if e != nil && e.googleQuotaEvidence && !err.quotaExhausted {
+		err.quotaExhausted, err.quotaResetAfter = helps.GoogleQuotaExhaustion(status, headers, body, time.Now())
+	}
+	return err
+}
+
+// isOpenAIInsufficientQuotaError reports whether body is an OpenAI
+// insufficient_quota error: the account's billing quota is exhausted, which a
+// retry does not fix.
+func isOpenAIInsufficientQuotaError(body []byte) bool {
+	for _, path := range []string{"error.code", "error.type"} {
+		if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, path).String()), "insufficient_quota") {
+			return true
+		}
+	}
+	return false
 }
 
 // openAICompatRetryAfter preserves the provider's standard Retry-After signal.
