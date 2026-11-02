@@ -422,7 +422,11 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 								// stream, where the usage-limit response mode may turn it
 								// into an error event. Closing here first would drop that
 								// event, so the turn's terminal handling closes instead.
-								if !activeTurn.wait(wsDone) {
+								// The wait ends early when the socket is canceled, and
+								// after a grace period when the turn cannot finish (for
+								// example while a client that stopped reading blocks a
+								// write); the close below then releases the writer.
+								if !activeTurn.wait(wsDone, socketCtx.Done(), responsesWebsocketUsageLimitDisconnectGrace) {
 									return
 								}
 							}
@@ -1185,17 +1189,30 @@ func (t *responsesWebsocketTurnTracker) begin() func() {
 	}
 }
 
-// wait blocks until the running turn, if any, has ended. It reports false when
-// the connection finished first.
-func (t *responsesWebsocketTurnTracker) wait(connectionDone <-chan struct{}) bool {
+// responsesWebsocketUsageLimitDisconnectGrace bounds how long a quota
+// disconnect defers closing the socket to the running turn. A turn whose
+// terminal event is ready finishes in milliseconds; one that is still blocked
+// after this long cannot deliver the event, and the socket is closed as it is
+// without the wait.
+var responsesWebsocketUsageLimitDisconnectGrace = 5 * time.Second
+
+// wait blocks until the running turn, if any, has ended, canceled is closed, or
+// grace has passed. It reports false when the connection finished first.
+func (t *responsesWebsocketTurnTracker) wait(connectionDone, canceled <-chan struct{}, grace time.Duration) bool {
 	t.mu.Lock()
 	done := t.done
 	t.mu.Unlock()
 	if done == nil {
 		return true
 	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
 	select {
 	case <-done:
+		return true
+	case <-canceled:
+		return true
+	case <-timer.C:
 		return true
 	case <-connectionDone:
 		return false

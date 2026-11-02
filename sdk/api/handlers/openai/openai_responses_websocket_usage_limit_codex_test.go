@@ -3,6 +3,7 @@ package openai
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -33,6 +34,13 @@ const (
 // runRealCodexWebsocketTurn returns the frames the client receives after
 // response.created when the upstream answers the turn with failure.
 func runRealCodexWebsocketTurn(t *testing.T, mode string, steering bool, failure string) []string {
+	frames, _ := runRealCodexWebsocketTurnWithClose(t, mode, steering, failure)
+	return frames
+}
+
+// runRealCodexWebsocketTurnWithClose also returns the error that ended the
+// client's reads, which carries the close code.
+func runRealCodexWebsocketTurnWithClose(t *testing.T, mode string, steering bool, failure string) ([]string, error) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	coreauth.SetQuotaCooldownResponseMode(mode)
@@ -110,7 +118,7 @@ func runRealCodexWebsocketTurn(t *testing.T, mode string, steering bool, failure
 			if errors.As(errNext, &netErr) && netErr.Timeout() {
 				t.Fatalf("websocket stayed open after the failure; frames=%q", frames)
 			}
-			return frames
+			return frames, errNext
 		}
 		frames = append(frames, string(payload))
 	}
@@ -160,10 +168,11 @@ func TestRealCodexWebsocketRetryableModeUnchanged(t *testing.T) {
 				want = []string{failure}
 			}
 			t.Run(label, func(t *testing.T) {
-				frames := runRealCodexWebsocketTurn(t, "retryable", steering, failure)
+				frames, closeErr := runRealCodexWebsocketTurnWithClose(t, "retryable", steering, failure)
 				if strings.Join(frames, "\n") != strings.Join(want, "\n") {
 					t.Fatalf("frames = %q, want %q", frames, want)
 				}
+				assertAbnormalClose(t, closeErr)
 			})
 		}
 	}
@@ -280,5 +289,228 @@ func TestRealCodexDuplexRecoverableErrorNotHeld(t *testing.T) {
 				t.Fatalf("frame = %s, want the upstream error unchanged", payload)
 			}
 		})
+	}
+}
+
+// blockedTurn is a real Codex WebSocket turn (steering off) whose upstream
+// sends a 16 MiB output delta and then a quota failure.
+type blockedTurn struct {
+	client      *websocket.Conn
+	handlerDone chan struct{}
+	failureSent chan struct{}
+	// upstreamGone closes when the executor has closed the upstream after the
+	// failure, so its disconnect notification has been posted.
+	upstreamGone chan struct{}
+	cancel       context.CancelFunc
+	bigFrame     int
+}
+
+func startRealCodexBlockedTurn(t *testing.T, mode string) *blockedTurn {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	coreauth.SetQuotaCooldownResponseMode(mode)
+	t.Cleanup(func() { coreauth.SetQuotaCooldownResponseMode("") })
+
+	turn := &blockedTurn{handlerDone: make(chan struct{}), failureSent: make(chan struct{}), upstreamGone: make(chan struct{}), bigFrame: 16 << 20}
+	delta := `{"type":"response.output_text.delta","delta":"` + strings.Repeat("x", turn.bigFrame) + `"}`
+	releaseOutput := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upstream upgrade: %v", errUpgrade)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("upstream read create: %v", errRead)
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"r1","output":[]}}`))
+		<-releaseOutput
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(delta))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(codexQuotaFrameDirect))
+		close(turn.failureSent)
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		_, _, _ = conn.ReadMessage()
+		close(turn.upstreamGone)
+	}))
+
+	cfg := &config.Config{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(cfg)
+	manager.RegisterExecutor(runtimeexecutor.NewCodexAutoExecutor(cfg))
+	model := "usage-limit-codex-ws-" + uuid.NewString()
+	authID := model + "-auth"
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+		ID:         authID,
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"base_url": upstream.URL, "websockets": "true"},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&cfg.SDKConfig, manager))
+	router := gin.New()
+	cancels := make(chan context.CancelFunc, 1)
+	router.GET("/v1/responses", func(c *gin.Context) {
+		defer close(turn.handlerDone)
+		ctx, cancel := context.WithCancel(c.Request.Context())
+		defer cancel()
+		cancels <- cancel
+		c.Request = c.Request.WithContext(ctx)
+		h.ResponsesWebsocket(c)
+	})
+	downstream := httptest.NewServer(router)
+
+	client, _, errDial := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(downstream.URL, "http")+"/v1/responses", nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	turn.client = client
+	turn.cancel = <-cancels
+	// Cleanups run last-in first-out: the client closes before the servers,
+	// so a blocked handler can always finish and the servers can shut down.
+	t.Cleanup(upstream.Close)
+	t.Cleanup(downstream.Close)
+	t.Cleanup(func() {
+		_ = client.Close()
+		<-turn.handlerDone
+	})
+
+	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if errWrite := client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"`+model+`","input":[]}`)); errWrite != nil {
+		t.Fatalf("write create: %v", errWrite)
+	}
+	if _, first, errRead := client.ReadMessage(); errRead != nil || ojson.GetBytes(first, "type").String() != "response.created" {
+		t.Fatalf("read response.created: %s, %v", first, errRead)
+	}
+	close(releaseOutput)
+	return turn
+}
+
+// blockClient reads the start of the large frame, so the handler is inside its
+// write, then stops reading so that write cannot finish. It returns once the
+// executor has seen the quota failure and closed the upstream, which posts its
+// disconnect notification.
+func (b *blockedTurn) blockClient(t *testing.T) {
+	t.Helper()
+	_ = b.client.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, reader, errNext := b.client.NextReader()
+	if errNext != nil {
+		t.Fatalf("start reading the large frame: %v", errNext)
+	}
+	head := make([]byte, 1024)
+	if _, errRead := io.ReadFull(reader, head); errRead != nil {
+		t.Fatalf("read the start of the large frame: %v", errRead)
+	}
+	if !strings.HasPrefix(string(head), `{"type":"response.output_text.delta"`) {
+		t.Fatalf("frame after response.created starts %q, want the large delta", head[:64])
+	}
+	for _, step := range []struct {
+		done <-chan struct{}
+		what string
+	}{{b.failureSent, "send the quota failure"}, {b.upstreamGone, "see the upstream close"}} {
+		select {
+		case <-step.done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("upstream did not %s", step.what)
+		}
+	}
+	if b.handlerExitsWithin(0) {
+		t.Fatal("handler exited although the client is blocking its write")
+	}
+}
+
+func (b *blockedTurn) handlerExitsWithin(limit time.Duration) bool {
+	select {
+	case <-b.handlerDone:
+		return true
+	case <-time.After(limit):
+		return false
+	}
+}
+
+// A client that stops reading during a large frame blocks the downstream
+// write. When the upstream then fails with exhausted quota, the handler must
+// still finish: at once when the request is canceled, and within a bounded
+// time when nothing cancels it. Retryable mode closes at once, as before.
+func TestRealCodexWebsocketBlockedClientDoesNotHangHandler(t *testing.T) {
+	t.Run("usage-limit/request-canceled", func(t *testing.T) {
+		turn := startRealCodexBlockedTurn(t, "usage-limit")
+		turn.blockClient(t)
+		turn.cancel()
+		if !turn.handlerExitsWithin(3 * time.Second) {
+			t.Fatal("handler still blocked 3s after the request was canceled")
+		}
+	})
+	t.Run("usage-limit/upstream-disconnect", func(t *testing.T) {
+		turn := startRealCodexBlockedTurn(t, "usage-limit")
+		turn.blockClient(t)
+		if !turn.handlerExitsWithin(15 * time.Second) {
+			t.Fatal("handler still blocked 15s after the upstream failed")
+		}
+	})
+	t.Run("retryable/upstream-disconnect", func(t *testing.T) {
+		// Retryable mode closes the socket as soon as the upstream fails, as
+		// on base, so the client cannot block the handler at all.
+		turn := startRealCodexBlockedTurn(t, "retryable")
+		select {
+		case <-turn.failureSent:
+		case <-time.After(10 * time.Second):
+			t.Fatal("upstream did not send the quota failure")
+		}
+		if !turn.handlerExitsWithin(3 * time.Second) {
+			t.Fatal("handler still blocked 3s after the upstream failed")
+		}
+		_ = turn.client.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for {
+			_, payload, errRead := turn.client.ReadMessage()
+			if errRead != nil {
+				assertAbnormalClose(t, errRead)
+				return
+			}
+			if got := ojson.GetBytes(payload, "type").String(); got != "response.output_text.delta" {
+				t.Fatalf("frame type = %q, want only output before the silent close", got)
+			}
+		}
+	})
+}
+
+// A client that keeps reading gets the large frame and then exactly one
+// usage-limit event.
+func TestRealCodexWebsocketReadingClientGetsUsageLimitAfterLargeFrame(t *testing.T) {
+	turn := startRealCodexBlockedTurn(t, "usage-limit")
+	_ = turn.client.SetReadDeadline(time.Now().Add(15 * time.Second))
+	_, big, errRead := turn.client.ReadMessage()
+	if errRead != nil {
+		t.Fatalf("read large frame: %v", errRead)
+	}
+	if len(big) < turn.bigFrame || ojson.GetBytes(big, "type").String() != "response.output_text.delta" {
+		t.Fatalf("first frame after response.created is %d bytes of type %q, want the large delta", len(big), ojson.GetBytes(big, "type").String())
+	}
+	var frames []string
+	for {
+		_, payload, errNext := turn.client.ReadMessage()
+		if errNext != nil {
+			break
+		}
+		frames = append(frames, string(payload))
+	}
+	if len(frames) != 1 {
+		t.Fatalf("terminal frames = %d (%q), want exactly one usage-limit event", len(frames), frames)
+	}
+	assertCodexWebsocketUsageLimit(t, frames[0])
+}
+
+// assertAbnormalClose checks that the socket closed without a close frame
+// (1006), the way the retryable mode closes on base.
+func assertAbnormalClose(t *testing.T, err error) {
+	t.Helper()
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseAbnormalClosure {
+		t.Fatalf("close = %v, want 1006 (abnormal closure)", err)
 	}
 }
