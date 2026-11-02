@@ -227,6 +227,11 @@ func TestStreamPayloadIsQuotaFailure(t *testing.T) {
 		`{"type":"error","error":{"type":"usage_limit_reached","status":400,"message":"x"}}`:                   false,
 		`{"type":"error","status":429,"error":{"type":"invalid_request_error","message":"too many requests"}}`: true,
 		`{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"slow down"}}}`: true,
+		// error.code is a status only as a JSON number (Google's shape); a
+		// string code is a name, as in the Codex executors.
+		`{"type":"error","error":{"type":"invalid_request_error","code":"429","message":"correct request"}}`:            false,
+		`{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","code":"400","message":"quota"}}}`: true,
+		`{"error":{"code":400,"type":"rate_limit_exceeded","message":"x"}}`:                                             false,
 		// Numeric strings count as statuses, as ojson Int() reads them in the
 		// executors.
 		`{"type":"error","status":"400","error":{"type":"rate_limit_error","message":"correct request"}}`:    false,
