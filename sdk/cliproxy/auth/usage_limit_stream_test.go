@@ -207,14 +207,17 @@ func TestStreamUsageLimitDoesNotDelayOtherFrames(t *testing.T) {
 func TestStreamPayloadIsQuotaFailure(t *testing.T) {
 	cases := map[string]bool{
 		codexDuplexQuotaFrame: true,
-		`{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","message":"x"}}}`:             true,
-		`{"error":{"type":"insufficient_quota","message":"x"}}`:                                                    true,
-		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"x\"}}\n\n": true,
-		`{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"x"}}`:                                       true,
-		`{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"x"}}`:                     false,
-		`{"type":"response.output_text.delta","delta":"usage_limit_reached"}`:                                      false,
-		`{"choices":[{"delta":{"content":"x"}}],"error":{"type":"rate_limit_exceeded"}}`:                           false,
-		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"x\"}}\n\n": false,
+		// The Codex WebSocket error shape with the error nested under body.
+		`{"type":"error","status":429,"body":{"error":{"type":"usage_limit_reached","message":"quota","resets_in_seconds":7200}}}`: true,
+		`{"type":"error","status_code":429,"body":{"error":{"type":"usage_limit_reached","message":"quota"}}}`:                     true,
+		`{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","message":"x"}}}`:                             true,
+		`{"error":{"type":"insufficient_quota","message":"x"}}`:                                                                    true,
+		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"x\"}}\n\n":                 true,
+		`{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"x"}}`:                                                       true,
+		`{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"x"}}`:                                     false,
+		`{"type":"response.output_text.delta","delta":"usage_limit_reached"}`:                                                      false,
+		`{"choices":[{"delta":{"content":"x"}}],"error":{"type":"rate_limit_exceeded"}}`:                                           false,
+		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"x\"}}\n\n":                 false,
 		``: false,
 	}
 	for payload, want := range cases {
