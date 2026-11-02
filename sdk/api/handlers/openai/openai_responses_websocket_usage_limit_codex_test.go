@@ -147,7 +147,14 @@ func TestRealCodexWebsocketMidStreamQuotaClosesSilently(t *testing.T) {
 // error chunk. A wrapped frame ({"body":{"error":...}}) must be intercepted
 // like a direct one, so the client gets only the usage-limit event.
 func TestRealCodexDuplexQuotaFrameSentOnce(t *testing.T) {
-	for name, failure := range map[string]string{"direct": codexQuotaFrameDirect, "wrapped": codexQuotaFrameWrapped} {
+	failures := map[string]string{
+		"direct":  codexQuotaFrameDirect,
+		"wrapped": codexQuotaFrameWrapped,
+		// A string error.code is not a status: the executor treats this as a
+		// quota failure (429) because of its type.
+		"response-failed-string-code": `{"type":"response.failed","response":{"id":"r1","status":"failed","error":{"type":"usage_limit_reached","code":"400","message":"quota","resets_in_seconds":7200}}}`,
+	}
+	for name, failure := range failures {
 		t.Run(name, func(t *testing.T) {
 			frames := runRealCodexWebsocketTurn(t, "usage-limit", true, failure)
 			if len(frames) != 1 {
@@ -284,6 +291,9 @@ func TestRealCodexDuplexRecoverableErrorNotHeld(t *testing.T) {
 		"numeric-status": `{"type":"error","status":400,"error":{"type":"rate_limit_error","message":"correct this request"}}`,
 		// The executor reads "400" as 400 too.
 		"string-status": `{"type":"error","status":"400","error":{"type":"rate_limit_error","message":"correct request"}}`,
+		// A string error.code is not a status; the executor classifies this
+		// frame by its type as a recoverable 400.
+		"string-code": `{"type":"error","error":{"type":"invalid_request_error","code":"429","message":"correct request"}}`,
 	}
 	for name, failure := range failures {
 		for _, mode := range []string{"retryable", "usage-limit"} {
