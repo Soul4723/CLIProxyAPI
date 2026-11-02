@@ -59,7 +59,12 @@ func getPublicIP() (string, error) {
 			log.Debugf("Failed to read response body from %s: %v", service, err)
 			continue
 		}
-		return strings.TrimSpace(string(ip)), nil
+		address := strings.TrimSpace(string(ip))
+		if net.ParseIP(address) == nil {
+			log.Debugf("Invalid public IP response from %s", service)
+			continue
+		}
+		return address, nil
 	}
 	return "", fmt.Errorf("all IP services failed")
 }
