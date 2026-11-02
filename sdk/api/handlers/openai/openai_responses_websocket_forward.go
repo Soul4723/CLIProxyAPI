@@ -109,6 +109,27 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	// handleErr ends the turn on a terminal stream error (non-nil errMsg).
 	handleErr := func(errMsg *interfaces.ErrorMessage) ([]byte, string, []string, *interfaces.ErrorMessage, error) {
 		h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+		if coreauth.IsUsageLimitReachedError(errMsg.Error) {
+			// Every credential is out of quota until a known reset. Neither a
+			// silent close nor a replay close (1012) can succeed on reconnect,
+			// so the client gets the usage limit before the socket closes.
+			markAPIResponseTimestamp(c)
+			errorPayload, wrote, errTerminate := writeResponsesWebsocketTerminalError(writer, wsTimelineLog, errMsg, nil)
+			if wrote {
+				log.Infof(
+					"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
+					sessionID,
+					websocket.TextMessage,
+					websocketPayloadEventType(errorPayload),
+					websocketPayloadPreview(errorPayload),
+				)
+			}
+			cancel(errMsg.Error)
+			if errTerminate == nil {
+				errTerminate = websocket.ErrCloseSent
+			}
+			return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, errTerminate
+		}
 		if opts.suppressError != nil && opts.suppressError(errMsg) {
 			cancel(errMsg.Error)
 			return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, nil
@@ -389,12 +410,16 @@ func responsesWebsocketErrorStatus(errMsg *interfaces.ErrorMessage) int {
 // credential rotation or retry can make the request succeed. Credential, quota
 // and transport failures stay silent so the client simply reconnects and retries;
 // a fresh connection carries no server-side transcript, so reconnecting already
-// implies a full context resend.
+// implies a full context resend. A final usage limit is exposed too: every
+// credential is out of quota until a known reset, so a reconnect cannot succeed.
 func shouldExposeResponsesUpstreamError(errMsg *interfaces.ErrorMessage) bool {
 	if errMsg == nil {
 		return false
 	}
 	if coreauth.IsTerminalAuthError(errMsg.Error) {
+		return true
+	}
+	if coreauth.IsUsageLimitReachedError(errMsg.Error) {
 		return true
 	}
 	return clienterror.IsRequestFault(responsesWebsocketErrorStatus(errMsg), errMsg.Error)
@@ -731,6 +756,9 @@ func buildResponsesWebsocketErrorPayload(errMsg *interfaces.ErrorMessage) ([]byt
 		if errMsg.Error != nil && strings.TrimSpace(errMsg.Error.Error()) != "" {
 			errText = errMsg.Error.Error()
 		}
+		if usageLimit, ok := coreauth.UsageLimitResponseText(errMsg.Error); ok {
+			errText = usageLimit
+		}
 	}
 
 	var errCause error
@@ -746,10 +774,24 @@ func buildResponsesWebsocketErrorPayload(errMsg *interfaces.ErrorMessage) ([]byt
 		return nil, errSet
 	}
 
-	if errMsg != nil && errMsg.Addon != nil {
+	var eventHeaders http.Header
+	if errMsg != nil {
+		eventHeaders = errMsg.Addon
+		if coreauth.IsUsageLimitReachedError(errMsg.Error) {
+			// The event carries the usage limit's headers as an HTTP response
+			// would: Codex reads its rate-limit window from them. Retry-After
+			// is dropped for the same reason as on HTTP.
+			eventHeaders = eventHeaders.Clone()
+			if eventHeaders == nil {
+				eventHeaders = make(http.Header)
+			}
+			handlers.WriteUsageLimitHeaders(eventHeaders, errMsg.Error)
+		}
+	}
+	if eventHeaders != nil {
 		headersDoc := ojson.NewDoc([]byte(`{}`))
 		hasHeaders := false
-		for key, values := range errMsg.Addon {
+		for key, values := range eventHeaders {
 			if len(values) == 0 {
 				continue
 			}

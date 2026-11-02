@@ -37,6 +37,15 @@ func usageLimitCooldown(err error) *modelCooldownError {
 	return nil
 }
 
+// UsageLimitResponseText returns the JSON error body of the final usage-limit
+// cooldown in err's chain, so a wrapped error still renders the usage limit.
+func UsageLimitResponseText(err error) (string, bool) {
+	if cooldown := usageLimitCooldown(err); cooldown != nil {
+		return cooldown.Error(), true
+	}
+	return "", false
+}
+
 // IsUsageLimitReachedError reports whether err carries a final usage-limit
 // cooldown.
 func IsUsageLimitReachedError(err error) bool { return usageLimitCooldown(err) != nil }
