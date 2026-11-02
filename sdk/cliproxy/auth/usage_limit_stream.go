@@ -118,10 +118,11 @@ func jsonIsQuotaFailure(data []byte) bool {
 	if eventType != "" && eventType != "error" && eventType != "response.failed" {
 		return false
 	}
-	for _, status := range []ojson.Result{root.Get("status"), root.Get("status_code"), errorNode.Get("status"), errorNode.Get("status_code")} {
-		if status.Int() == http.StatusTooManyRequests {
-			return true
-		}
+	// An explicit status decides, as it does in the Codex executors: a frame
+	// that names another status is a recoverable error the executor forwards
+	// without an error chunk, so holding it would delay it indefinitely.
+	if status, ok := streamFailureStatus(root, errorNode); ok {
+		return status == http.StatusTooManyRequests
 	}
 	for _, value := range []string{errorNode.Get("type").String(), errorNode.Get("code").String(), errorNode.Get("status").String()} {
 		switch strings.ToLower(strings.TrimSpace(value)) {
@@ -177,4 +178,22 @@ func withoutQuotaFailureEvents(payload []byte) []byte {
 		return nil
 	}
 	return out
+}
+
+// streamFailureStatus reports the HTTP status a failure event names, in the
+// order the Codex executors read it: the event's own status or status_code,
+// then the error's status_code or status. A numeric error.code (Google's
+// error shape) counts too.
+func streamFailureStatus(root, errorNode ojson.Result) (int, bool) {
+	for _, value := range []ojson.Result{root.Get("status"), root.Get("status_code")} {
+		if value.Type == ojson.Number && value.Int() > 0 {
+			return int(value.Int()), true
+		}
+	}
+	for _, value := range []ojson.Result{errorNode.Get("status_code"), errorNode.Get("status"), errorNode.Get("code")} {
+		if status := value.Int(); value.Type == ojson.Number && status >= 400 && status <= 599 {
+			return int(status), true
+		}
+	}
+	return 0, false
 }

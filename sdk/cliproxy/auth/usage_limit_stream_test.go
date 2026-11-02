@@ -219,6 +219,14 @@ func TestStreamPayloadIsQuotaFailure(t *testing.T) {
 		`{"choices":[{"delta":{"content":"x"}}],"error":{"type":"rate_limit_exceeded"}}`:                                           false,
 		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"x\"}}\n\n":                 false,
 		``: false,
+		// An explicit non-429 status wins over the error type, as in the
+		// Codex executors: these are recoverable, not quota failures.
+		`{"type":"error","status":400,"error":{"type":"rate_limit_error","message":"correct this request"}}`:   false,
+		`{"type":"error","status_code":503,"error":{"type":"insufficient_quota","message":"x"}}`:               false,
+		`{"type":"response.failed","response":{"error":{"type":"rate_limit_error","status_code":400}}}`:        false,
+		`{"type":"error","error":{"type":"usage_limit_reached","status":400,"message":"x"}}`:                   false,
+		`{"type":"error","status":429,"error":{"type":"invalid_request_error","message":"too many requests"}}`: true,
+		`{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"slow down"}}}`: true,
 	}
 	for payload, want := range cases {
 		if got := streamPayloadIsQuotaFailure([]byte(payload)); got != want {

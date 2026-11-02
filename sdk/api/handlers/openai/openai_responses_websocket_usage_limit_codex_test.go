@@ -191,3 +191,94 @@ func assertCodexWebsocketUsageLimit(t *testing.T, payload string) {
 		t.Fatalf("headers.X-Should-Retry = %q, want false: %s", got, payload)
 	}
 }
+
+// runRealCodexRecoverableError returns the first frame the client receives
+// after response.created when the duplex upstream sends a recoverable error
+// and then waits for the client's next request.
+func runRealCodexRecoverableError(t *testing.T, mode string, failure string) ([]byte, error) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	coreauth.SetQuotaCooldownResponseMode(mode)
+	t.Cleanup(func() { coreauth.SetQuotaCooldownResponseMode("") })
+
+	releaseFailure := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upstream upgrade: %v", errUpgrade)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("upstream read create: %v", errRead)
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"r1","output":[]}}`))
+		<-releaseFailure
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(failure))
+		// Wait for the client's next request, as a duplex upstream does.
+		_, _, _ = conn.ReadMessage()
+	}))
+	t.Cleanup(upstream.Close)
+
+	cfg := &config.Config{}
+	cfg.Codex.ResponseSteering = true
+	cfg.CodexResponseSteering = true
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(cfg)
+	manager.RegisterExecutor(runtimeexecutor.NewCodexAutoExecutor(cfg))
+	model := "usage-limit-codex-ws-" + uuid.NewString()
+	authID := model + "-auth"
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+		ID:         authID,
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"base_url": upstream.URL, "websockets": "true"},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&cfg.SDKConfig, manager))
+	router := gin.New()
+	router.GET("/v1/responses", h.ResponsesWebsocket)
+	downstream := httptest.NewServer(router)
+	t.Cleanup(downstream.Close)
+
+	conn, _, errDial := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(downstream.URL, "http")+"/v1/responses", nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"`+model+`","input":[]}`)); errWrite != nil {
+		t.Fatalf("write create: %v", errWrite)
+	}
+	if _, first, errRead := conn.ReadMessage(); errRead != nil || ojson.GetBytes(first, "type").String() != "response.created" {
+		t.Fatalf("read response.created: %s, %v", first, errRead)
+	}
+	close(releaseFailure)
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, payload, errRead := conn.ReadMessage()
+	return payload, errRead
+}
+
+// A duplex error with an explicit status 400 is recoverable even when its type
+// names a rate limit. It is forwarded at once in both modes, not held for an
+// error chunk that never comes.
+func TestRealCodexDuplexRecoverableErrorNotHeld(t *testing.T) {
+	failure := `{"type":"error","status":400,"error":{"type":"rate_limit_error","message":"correct this request"}}`
+	for _, mode := range []string{"retryable", "usage-limit"} {
+		t.Run(mode, func(t *testing.T) {
+			payload, errRead := runRealCodexRecoverableError(t, mode, failure)
+			if errRead != nil {
+				t.Fatalf("recoverable error was not forwarded while the upstream waits: %v", errRead)
+			}
+			if string(payload) != failure {
+				t.Fatalf("frame = %s, want the upstream error unchanged", payload)
+			}
+		})
+	}
+}
