@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/safemode"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
@@ -35,15 +36,6 @@ var corsExposedResponseHeaders = []string{
 	"X-SERVER-BUILD-DATE",
 	"Location",
 	"Retry-After",
-	// A final usage limit carries no Retry-After; browser clients read these
-	// to stop and learn when quota returns.
-	"X-Should-Retry",
-	"X-Codex-Primary-Used-Percent",
-	"X-Codex-Primary-Window-Minutes",
-	"X-Codex-Primary-Reset-At",
-	"X-Codex-Secondary-Used-Percent",
-	"X-Codex-Secondary-Window-Minutes",
-	"X-Codex-Secondary-Reset-At",
 	// Cross-origin management clients must read the config version token to
 	// send it back as If-Match on writes.
 	"ETag",
@@ -52,6 +44,31 @@ var corsExposedResponseHeaders = []string{
 }
 
 var corsExposedResponseHeadersJoined = strings.Join(corsExposedResponseHeaders, ", ")
+
+// usageLimitCorsExposedResponseHeaders are exposed only in the usage-limit
+// quota response mode. A final usage limit carries no Retry-After; browser
+// clients read these to stop and learn when quota returns.
+var usageLimitCorsExposedResponseHeaders = []string{
+	"X-Should-Retry",
+	"X-Codex-Primary-Used-Percent",
+	"X-Codex-Primary-Window-Minutes",
+	"X-Codex-Primary-Reset-At",
+	"X-Codex-Secondary-Used-Percent",
+	"X-Codex-Secondary-Window-Minutes",
+	"X-Codex-Secondary-Reset-At",
+}
+
+var usageLimitCorsExposedResponseHeadersJoined = corsExposedResponseHeadersJoined + ", " +
+	strings.Join(usageLimitCorsExposedResponseHeaders, ", ")
+
+// corsExposedResponseHeadersValue keeps the base expose list in retryable
+// mode and appends the usage-limit headers only when that mode is active.
+func corsExposedResponseHeadersValue() string {
+	if coreauth.QuotaCooldownUsageLimitModeEnabled() {
+		return usageLimitCorsExposedResponseHeadersJoined
+	}
+	return corsExposedResponseHeadersJoined
+}
 
 // corsAllowedRequestHeaders lists the request headers browser clients may
 // send to the API. The Fetch standard treats Authorization as a CORS
@@ -442,7 +459,7 @@ func corsMiddleware() gin.HandlerFunc {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", corsAllowHeadersValue(c.Request))
-		c.Header("Access-Control-Expose-Headers", corsExposedResponseHeadersJoined)
+		c.Header("Access-Control-Expose-Headers", corsExposedResponseHeadersValue())
 
 		if c.Request.Method == "OPTIONS" {
 			closeUnconsumedRequestOnAbort(c)
