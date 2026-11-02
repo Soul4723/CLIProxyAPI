@@ -102,11 +102,8 @@ func streamPayloadIsQuotaFailure(payload []byte) bool {
 func jsonIsQuotaFailure(data []byte) bool {
 	root := ojson.ParseBytes(data)
 	eventType := root.Get("type").String()
-	errorNode := root.Get("error")
-	if eventType == "response.failed" {
-		errorNode = root.Get("response.error")
-	}
-	if !errorNode.IsObject() || root.Get("choices").Exists() {
+	errorNode, ok := streamFailureErrorNode(root, eventType)
+	if !ok || root.Get("choices").Exists() {
 		return false
 	}
 	if eventType != "" && eventType != "error" && eventType != "response.failed" {
@@ -124,4 +121,20 @@ func jsonIsQuotaFailure(data []byte) bool {
 		}
 	}
 	return false
+}
+
+// streamFailureErrorNode finds the error object of a failure event in the
+// places the Codex executors read it, in their order: body.error and error for
+// a WebSocket error event, response.error and error for response.failed.
+func streamFailureErrorNode(root ojson.Result, eventType string) (ojson.Result, bool) {
+	paths := []string{"body.error", "error"}
+	if eventType == "response.failed" {
+		paths = []string{"response.error", "error"}
+	}
+	for _, path := range paths {
+		if node := root.Get(path); node.IsObject() {
+			return node, true
+		}
+	}
+	return ojson.Result{}, false
 }

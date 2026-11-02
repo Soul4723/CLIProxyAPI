@@ -133,6 +133,21 @@ func TestRealCodexWebsocketUsageLimitBeatsDisconnectClose(t *testing.T) {
 	}
 }
 
+// With steering on, the duplex executor forwards the upstream frame before its
+// error chunk. A wrapped frame ({"body":{"error":...}}) must be intercepted
+// like a direct one, so the client gets only the usage-limit event.
+func TestRealCodexDuplexQuotaFrameSentOnce(t *testing.T) {
+	for name, failure := range map[string]string{"direct": codexQuotaFrameDirect, "wrapped": codexQuotaFrameWrapped} {
+		t.Run(name, func(t *testing.T) {
+			frames := runRealCodexWebsocketTurn(t, "usage-limit", true, failure)
+			if len(frames) != 1 {
+				t.Fatalf("terminal frames = %d (%q), want exactly one usage-limit event", len(frames), frames)
+			}
+			assertCodexWebsocketUsageLimit(t, frames[0])
+		})
+	}
+}
+
 // Retryable mode keeps the base behaviour: a silent close without steering,
 // and the upstream frame alone with steering.
 func TestRealCodexWebsocketRetryableModeUnchanged(t *testing.T) {
