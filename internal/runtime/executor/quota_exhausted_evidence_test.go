@@ -3,7 +3,9 @@ package executor
 import (
 	"errors"
 	"net/http"
+	"strconv"
 	"testing"
+	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
@@ -33,10 +35,12 @@ func TestStatusErrorsReportOnlyStructuredQuotaExhaustion(t *testing.T) {
 		}
 	}
 	claudeRejected := func(window string) http.Header {
+		reset := strconv.FormatInt(time.Now().Add(2*time.Hour).Unix(), 10)
 		return http.Header{
 			"Anthropic-Ratelimit-Unified-Status":                {"rejected"},
 			"Anthropic-Ratelimit-Unified-" + window + "-Status": {"rejected"},
-			"Anthropic-Ratelimit-Unified-Reset":                 {"1793590000"},
+			"Anthropic-Ratelimit-Unified-" + window + "-Reset":  {reset},
+			"Anthropic-Ratelimit-Unified-Reset":                 {reset},
 		}
 	}
 	tests := []struct {
@@ -75,6 +79,62 @@ func TestStatusErrorsReportOnlyStructuredQuotaExhaustion(t *testing.T) {
 			got, window := quotaEvidenceOf(test.err)
 			if got != test.want || window != test.wantWindow {
 				t.Fatalf("evidence = (%t, %d), want (%t, %d); err=%v", got, window, test.want, test.wantWindow, test.err)
+			}
+		})
+	}
+}
+
+// The window must be the one whose reset is the deadline the cooldown keeps.
+func TestClaudeQuotaWindowMatchesRetainedReset(t *testing.T) {
+	now := time.Now()
+	unix := func(d time.Duration) string { return strconv.FormatInt(now.Add(d).Unix(), 10) }
+	body := []byte(`{"type":"error","error":{"type":"rate_limit_error","message":"limited"}}`)
+	for _, tc := range []struct {
+		name       string
+		headers    http.Header
+		wantWindow int64
+		wantReset  time.Duration
+	}{
+		{
+			name: "5h resets after weekly",
+			headers: http.Header{
+				"Anthropic-Ratelimit-Unified-Status":    {"rejected"},
+				"Anthropic-Ratelimit-Unified-5h-Status": {"rejected"}, "Anthropic-Ratelimit-Unified-5h-Reset": {unix(4 * time.Hour)},
+				"Anthropic-Ratelimit-Unified-7d-Status": {"rejected"}, "Anthropic-Ratelimit-Unified-7d-Reset": {unix(time.Hour)},
+			},
+			wantWindow: 300, wantReset: 4 * time.Hour,
+		},
+		{
+			name: "weekly resets after 5h",
+			headers: http.Header{
+				"Anthropic-Ratelimit-Unified-Status":    {"rejected"},
+				"Anthropic-Ratelimit-Unified-5h-Status": {"rejected"}, "Anthropic-Ratelimit-Unified-5h-Reset": {unix(time.Hour)},
+				"Anthropic-Ratelimit-Unified-7d-Status": {"rejected"}, "Anthropic-Ratelimit-Unified-7d-Reset": {unix(3 * 24 * time.Hour)},
+			},
+			wantWindow: 10080, wantReset: 3 * 24 * time.Hour,
+		},
+		{
+			name: "Retry-After later than the rejected window stays unknown",
+			headers: http.Header{
+				"Anthropic-Ratelimit-Unified-Status":    {"rejected"},
+				"Anthropic-Ratelimit-Unified-5h-Status": {"rejected"}, "Anthropic-Ratelimit-Unified-5h-Reset": {unix(time.Hour)},
+				"Retry-After": {"7200"},
+			},
+			wantWindow: 0, wantReset: 2 * time.Hour,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := classifyClaudeUpstreamError(http.StatusTooManyRequests, tc.headers, body)
+			exhausted, window := quotaEvidenceOf(err)
+			if !exhausted || window != tc.wantWindow {
+				t.Fatalf("evidence = (%t, %d), want (true, %d)", exhausted, window, tc.wantWindow)
+			}
+			hint, ok := err.(interface{ RetryAfter() *time.Duration })
+			if !ok || hint.RetryAfter() == nil {
+				t.Fatalf("missing reset on %T", err)
+			}
+			if got := *hint.RetryAfter(); got < tc.wantReset-time.Minute || got > tc.wantReset+time.Minute {
+				t.Fatalf("reset = %v, want about %v", got, tc.wantReset)
 			}
 		})
 	}

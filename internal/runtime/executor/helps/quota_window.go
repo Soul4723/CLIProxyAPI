@@ -58,20 +58,6 @@ func CodexExhaustedWindowMinutes(headers http.Header, body []byte) int64 {
 	return 0
 }
 
-// ClaudeRejectedWindowMinutes reports the length, in minutes, of the Anthropic
-// unified window whose status header says rejected: 7 days when the weekly
-// window is rejected, otherwise 5 hours when the 5-hour window is. It returns
-// 0 when no window-specific status is rejected.
-func ClaudeRejectedWindowMinutes(headers http.Header) int64 {
-	if strings.EqualFold(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d-Status")), "rejected") {
-		return claudeSevenDayWindowMinutes
-	}
-	if strings.EqualFold(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-5h-Status")), "rejected") {
-		return claudeFiveHourWindowMinutes
-	}
-	return 0
-}
-
 func parseHeaderFloat(headers http.Header, name string) (float64, bool) {
 	if headers == nil {
 		return 0, false
