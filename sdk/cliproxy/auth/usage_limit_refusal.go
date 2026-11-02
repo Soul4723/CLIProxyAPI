@@ -94,34 +94,83 @@ func (r *usageLimitRefusal) codexRateLimitHeaders(headers http.Header) {
 	headers.Set(prefix+"Reset-At", strconv.FormatInt(r.resetAt.Unix(), 10))
 }
 
+// usageLimitCandidate is one credential eligible for the request: the model
+// selection checks it under, and the state models normal execution records its
+// failures under (one per pooled backend).
+type usageLimitCandidate struct {
+	auth           *Auth
+	selectionModel string
+	stateModels    []string
+}
+
 // usageLimitRefusalFor reports the usage limit that blocks every candidate, or
-// nil when there is no candidate, any candidate is unblocked or blocked for
-// another reason, or the first reset is UsageLimitMinResetIn away or closer.
-// Only explicit quota-exhaustion evidence tied to the blocking deadline counts:
-// a long or repeated generic 429 stays retryable.
+// nil when there is no candidate, any candidate can still serve the request or
+// is blocked for another reason, or the first reset is UsageLimitMinResetIn
+// away or closer. Only explicit quota-exhaustion evidence tied to the blocking
+// deadline counts: a long or repeated generic 429 stays retryable.
 func usageLimitRefusalFor(auths []*Auth, modelFor func(*Auth) string, now time.Time) *usageLimitRefusal {
-	var refusal *usageLimitRefusal
+	candidates := make([]usageLimitCandidate, 0, len(auths))
 	for _, auth := range auths {
 		model := ""
 		if modelFor != nil {
 			model = modelFor(auth)
 		}
-		blocked, reason, next := isAuthBlockedForModel(auth, model, now)
-		if !blocked || reason != blockReasonCooldown || !next.After(now) {
-			return nil
-		}
-		window, ok := quotaExhaustionEvidence(auth, model, now)
+		candidates = append(candidates, usageLimitCandidate{auth: auth, selectionModel: model})
+	}
+	return usageLimitRefusalForCandidates(candidates, now)
+}
+
+func usageLimitRefusalForCandidates(candidates []usageLimitCandidate, now time.Time) *usageLimitRefusal {
+	var refusal *usageLimitRefusal
+	for _, candidate := range candidates {
+		resetAt, window, ok := candidateQuotaBlock(candidate, now)
 		if !ok {
 			return nil
 		}
-		if refusal == nil || next.Before(refusal.resetAt) || (next.Equal(refusal.resetAt) && refusal.windowMinutes == 0) {
-			refusal = &usageLimitRefusal{resetAt: next, windowMinutes: window}
+		if refusal == nil || resetAt.Before(refusal.resetAt) || (resetAt.Equal(refusal.resetAt) && refusal.windowMinutes == 0) {
+			refusal = &usageLimitRefusal{resetAt: resetAt, windowMinutes: window}
 		}
 	}
 	if refusal == nil || refusal.resetAt.Sub(now) <= UsageLimitMinResetIn {
 		return nil
 	}
 	return refusal
+}
+
+// candidateQuotaBlock reports when a credential can serve the request again,
+// and the exhausted window length when known, if what blocks it is explicit
+// quota exhaustion. Selection blocks a credential under its selection model;
+// otherwise it can still serve the request through any execution model whose
+// state is not blocked, so every one of those must be blocked by evidence and
+// the credential reopens with the first of them.
+func candidateQuotaBlock(candidate usageLimitCandidate, now time.Time) (time.Time, int64, bool) {
+	auth := candidate.auth
+	if blocked, reason, next := isAuthBlockedForModel(auth, candidate.selectionModel, now); blocked {
+		if reason != blockReasonCooldown || !next.After(now) {
+			return time.Time{}, 0, false
+		}
+		window, ok := quotaExhaustionEvidence(auth, candidate.selectionModel, now)
+		return next, window, ok
+	}
+	if len(candidate.stateModels) == 0 {
+		return time.Time{}, 0, false
+	}
+	var resetAt time.Time
+	var window int64
+	for _, stateModel := range candidate.stateModels {
+		blocked, reason, next := isAuthBlockedForModel(auth, stateModel, now)
+		if !blocked || reason != blockReasonCooldown || !next.After(now) {
+			return time.Time{}, 0, false
+		}
+		stateWindow, ok := quotaExhaustionEvidence(auth, stateModel, now)
+		if !ok {
+			return time.Time{}, 0, false
+		}
+		if resetAt.IsZero() || next.Before(resetAt) {
+			resetAt, window = next, stateWindow
+		}
+	}
+	return resetAt, window, true
 }
 
 // quotaExhaustionEvidence reports whether the cooldown that blocks auth for
@@ -212,12 +261,19 @@ func (m *Manager) usageLimitRefusalForPool(providers []string, model string, eli
 		}
 		candidates = append(candidates, auth)
 	}
-	return usageLimitRefusalFor(candidates, func(auth *Auth) string {
-		if strings.TrimSpace(model) == "" {
-			return model
+	evaluated := make([]usageLimitCandidate, 0, len(candidates))
+	for _, auth := range candidates {
+		candidate := usageLimitCandidate{auth: auth, selectionModel: model}
+		if strings.TrimSpace(model) != "" {
+			candidate.selectionModel = m.selectionModelForAuth(auth, model)
+			upstreamModels, pooled := m.executionModelCandidatesForInspection(auth, model)
+			for _, upstreamModel := range upstreamModels {
+				candidate.stateModels = append(candidate.stateModels, m.stateModelForExecution(auth, model, upstreamModel, pooled))
+			}
 		}
-		return m.selectionModelForAuth(auth, model)
-	}, now)
+		evaluated = append(evaluated, candidate)
+	}
+	return usageLimitRefusalForCandidates(evaluated, now)
 }
 
 // usageLimitResponseError applies the usage-limit response mode to the final
@@ -233,7 +289,7 @@ func (m *Manager) usageLimitResponseError(ctx context.Context, providers []strin
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return nil
 	}
-	if statusCodeFromError(err) != http.StatusTooManyRequests {
+	if statusCodeFromError(err) != http.StatusTooManyRequests && !isNoExecutableCredentialError(err) {
 		return nil
 	}
 	now := time.Now()
@@ -258,4 +314,13 @@ func (m *Manager) usageLimitResponseError(ctx context.Context, providers []strin
 		cause = cooldown.cause
 	}
 	return newModelCooldownErrorWithCause(modelName, provider, refusal.resetAt.Sub(now), cause).withUsageLimit(refusal)
+}
+
+// isNoExecutableCredentialError reports the error a request ends with when no
+// credential could run it at all, for example when selection still offers a
+// pooled alias whose every backend is cooling. The pool check alone decides
+// whether that is a usage limit.
+func isNoExecutableCredentialError(err error) bool {
+	var authErr *Error
+	return errors.As(err, &authErr) && authErr != nil && authErr.Code == "auth_not_found"
 }
