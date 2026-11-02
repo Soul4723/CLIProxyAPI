@@ -374,6 +374,15 @@ func (e *GeminiVertexExecutor) resolveOpenAPICredentials(ctx context.Context, au
 	return openAPIBaseURL, apiKey, nil
 }
 
+// openAPIDelegate returns the OpenAI-compatible executor that serves Vertex
+// OpenAPI requests. Its upstream is Google, so it also reports Google
+// quota-exhaustion evidence.
+func (e *GeminiVertexExecutor) openAPIDelegate() *OpenAICompatExecutor {
+	delegate := NewOpenAICompatExecutor(e.Identifier(), e.cfg)
+	delegate.googleQuotaEvidence = true
+	return delegate
+}
+
 func (e *GeminiVertexExecutor) executeOpenAPI(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	req, opts = normalizeVertexOpenAPIRequest(req, opts)
 	openAPIBaseURL, token, errCreds := e.resolveOpenAPICredentials(ctx, auth)
@@ -383,7 +392,7 @@ func (e *GeminiVertexExecutor) executeOpenAPI(ctx context.Context, auth *cliprox
 		reporter.TrackFailure(ctx, &errCreds)
 		return resp, errCreds
 	}
-	return NewOpenAICompatExecutor(e.Identifier(), e.cfg).executeWithCredentials(ctx, auth, req, opts, openAPIBaseURL, token, nil)
+	return e.openAPIDelegate().executeWithCredentials(ctx, auth, req, opts, openAPIBaseURL, token, nil)
 }
 
 func (e *GeminiVertexExecutor) executeOpenAPIStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
@@ -395,7 +404,7 @@ func (e *GeminiVertexExecutor) executeOpenAPIStream(ctx context.Context, auth *c
 		reporter.TrackFailure(ctx, &errCreds)
 		return nil, errCreds
 	}
-	return NewOpenAICompatExecutor(e.Identifier(), e.cfg).executeStreamWithCredentials(ctx, auth, req, opts, openAPIBaseURL, token, nil)
+	return e.openAPIDelegate().executeStreamWithCredentials(ctx, auth, req, opts, openAPIBaseURL, token, nil)
 }
 
 // Refresh refreshes the authentication credentials (no-op for Vertex).

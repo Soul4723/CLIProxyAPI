@@ -52,6 +52,10 @@ func ensureOpenAICompatUserAgent(r *http.Request, clientHeaders ...http.Header) 
 type OpenAICompatExecutor struct {
 	provider string
 	cfg      *config.Config
+	// googleQuotaEvidence also reads Google quota-exhaustion evidence from
+	// upstream errors, for delegates whose upstream is a Google API (Vertex
+	// OpenAPI).
+	googleQuotaEvidence bool
 }
 
 // NewOpenAICompatExecutor creates an executor bound to a provider key (e.g., "openrouter").
@@ -222,7 +226,7 @@ func (e *OpenAICompatExecutor) executeWithCredentials(ctx context.Context, auth 
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = newOpenAICompatStatusError(httpResp.StatusCode, httpResp.Header, b)
+		err = e.statusError(httpResp.StatusCode, httpResp.Header, b)
 		return resp, err
 	}
 	body, err := io.ReadAll(httpResp.Body)
@@ -330,7 +334,7 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), body))
-		err = newOpenAICompatStatusError(httpResp.StatusCode, httpResp.Header, body)
+		err = e.statusError(httpResp.StatusCode, httpResp.Header, body)
 		return resp, err
 	}
 
@@ -457,7 +461,7 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
 		}
-		err = newOpenAICompatStatusError(httpResp.StatusCode, httpResp.Header, b)
+		err = e.statusError(httpResp.StatusCode, httpResp.Header, b)
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -1244,6 +1248,17 @@ func newOpenAICompatStatusError(status int, headers http.Header, body []byte) st
 		retryAfter:     openAICompatRetryAfter(status, headers, body, time.Now()),
 		quotaExhausted: status == http.StatusTooManyRequests && isOpenAIInsufficientQuotaError(body),
 	}
+}
+
+// statusError builds the error for a non-2xx upstream response. With
+// googleQuotaEvidence it adds Google quota-exhaustion evidence and its reset
+// without changing the error text or the retry hint.
+func (e *OpenAICompatExecutor) statusError(status int, headers http.Header, body []byte) statusErr {
+	err := newOpenAICompatStatusError(status, headers, body)
+	if e != nil && e.googleQuotaEvidence && !err.quotaExhausted {
+		err.quotaExhausted, err.quotaResetAfter = helps.GoogleQuotaExhaustion(status, headers, body, time.Now())
+	}
+	return err
 }
 
 // isOpenAIInsufficientQuotaError reports whether body is an OpenAI
