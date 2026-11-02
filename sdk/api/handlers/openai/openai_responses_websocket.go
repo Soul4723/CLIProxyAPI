@@ -125,23 +125,7 @@ func websocketClosePayloadForUpstreamError(err error) (bool, []byte) {
 type responsesWebsocketWriter struct {
 	conn    *websocket.Conn
 	writeMu sync.Mutex
-	// closing claims terminal closure: once set, no other terminal event or
-	// close frame is written, so the client never gets two.
 	closing atomic.Bool
-	// transportClosed records that the underlying connection was closed.
-	// Closing the transport is separate from claiming terminal closure: a
-	// silent, disconnect or cancel close always closes the connection, even
-	// while another goroutine's claimed terminal write is blocked, so that
-	// write and the session can exit.
-	transportClosed atomic.Bool
-}
-
-// closeTransport closes the underlying connection once.
-func (w *responsesWebsocketWriter) closeTransport() error {
-	if w == nil || w.conn == nil || !w.transportClosed.CompareAndSwap(false, true) {
-		return nil
-	}
-	return w.conn.Close()
 }
 
 func newResponsesWebsocketWriter(conn *websocket.Conn) *responsesWebsocketWriter {
@@ -160,29 +144,29 @@ func (w *responsesWebsocketWriter) closeForUpstreamError(err error) (bool, error
 		return false, nil
 	}
 	if !w.closing.CompareAndSwap(false, true) {
-		return true, w.closeTransport()
+		return true, nil
 	}
 	if !w.writeMu.TryLock() {
-		return true, w.closeTransport()
+		return true, w.conn.Close()
 	}
 	defer w.writeMu.Unlock()
 
 	errWrite := w.conn.WriteControl(websocket.CloseMessage, payload, time.Time{})
-	errClose := w.closeTransport()
+	errClose := w.conn.Close()
 	if errWrite != nil {
 		return true, errWrite
 	}
 	return true, errClose
 }
 
-// closeWithoutError closes the connection without a terminal event. It reports
-// whether it claimed terminal closure; it closes the transport either way.
 func (w *responsesWebsocketWriter) closeWithoutError() (bool, error) {
 	if w == nil || w.conn == nil {
 		return false, nil
 	}
-	claimed := w.closing.CompareAndSwap(false, true)
-	return claimed, w.closeTransport()
+	if !w.closing.CompareAndSwap(false, true) {
+		return false, nil
+	}
+	return true, w.conn.Close()
 }
 
 func (w *responsesWebsocketWriter) writePing() error {
@@ -205,12 +189,12 @@ func (w *responsesWebsocketWriter) closeWithPayload(payload []byte) (bool, error
 		return false, nil
 	}
 	if !w.writeMu.TryLock() {
-		return false, w.closeTransport()
+		return false, w.conn.Close()
 	}
 	defer w.writeMu.Unlock()
 
 	errWrite := w.conn.WriteMessage(websocket.TextMessage, payload)
-	errClose := w.closeTransport()
+	errClose := w.conn.Close()
 	if errWrite != nil {
 		return false, errWrite
 	}
@@ -377,11 +361,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	// Apply the policy before routing so plugin callbacks inherit it as well.
 	socketCtx, cancelSocket := context.WithCancelCause(logging.WithDeferredAPIRequestCaptureDisabled(c.Request.Context()))
 	defer cancelSocket(nil)
-	// A canceled socket (the request was canceled or the client went away)
-	// closes the transport, so a write blocked on a client that stopped
-	// reading returns and the handler can exit.
-	stopCloseOnCancel := context.AfterFunc(socketCtx, func() { _ = writer.closeTransport() })
-	defer stopCloseOnCancel()
 	c.Request = c.Request.WithContext(socketCtx)
 	upgradeRequest := c.Request.Clone(socketCtx)
 	// The reader owns the client socket so an in-flight interrupt is not stuck
