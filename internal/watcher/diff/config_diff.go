@@ -55,6 +55,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.TransientErrorCooldownSeconds != newCfg.TransientErrorCooldownSeconds {
 		changes = append(changes, fmt.Sprintf("transient-error-cooldown-seconds: %d -> %d", oldCfg.TransientErrorCooldownSeconds, newCfg.TransientErrorCooldownSeconds))
 	}
+	if oldMode, newMode := quotaCooldownResponseModeLabel(oldCfg.QuotaCooldownResponseMode), quotaCooldownResponseModeLabel(newCfg.QuotaCooldownResponseMode); oldMode != newMode {
+		changes = append(changes, fmt.Sprintf("quota-cooldown-response-mode: %s -> %s", oldMode, newMode))
+	}
 	if oldCfg.DisableClaudeCloakMode != newCfg.DisableClaudeCloakMode {
 		changes = append(changes, fmt.Sprintf("disable-claude-cloak-mode: %t -> %t", oldCfg.DisableClaudeCloakMode, newCfg.DisableClaudeCloakMode))
 	}
@@ -727,4 +730,11 @@ func formatURL(raw string) string {
 		return host
 	}
 	return scheme + "://" + host
+}
+
+func quotaCooldownResponseModeLabel(mode string) string {
+	if strings.TrimSpace(mode) == "" {
+		return config.QuotaCooldownResponseModeRetryable
+	}
+	return mode
 }

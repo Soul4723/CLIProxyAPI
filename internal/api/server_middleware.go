@@ -35,6 +35,15 @@ var corsExposedResponseHeaders = []string{
 	"X-SERVER-BUILD-DATE",
 	"Location",
 	"Retry-After",
+	// A final usage limit carries no Retry-After; browser clients read these
+	// to stop and learn when quota returns.
+	"X-Should-Retry",
+	"X-Codex-Primary-Used-Percent",
+	"X-Codex-Primary-Window-Minutes",
+	"X-Codex-Primary-Reset-At",
+	"X-Codex-Secondary-Used-Percent",
+	"X-Codex-Secondary-Window-Minutes",
+	"X-Codex-Secondary-Reset-At",
 	// Cross-origin management clients must read the config version token to
 	// send it back as If-Match on writes.
 	"ETag",

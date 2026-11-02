@@ -144,6 +144,9 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 			}
 		}
 	}
+	if msg != nil {
+		WriteUsageLimitHeaders(c.Writer.Header(), msg.Error)
+	}
 
 	errText := http.StatusText(status)
 	if msg != nil && msg.Error != nil {
@@ -179,6 +182,32 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	}
 	c.Status(status)
 	_, _ = c.Writer.Write(body)
+}
+
+// WriteUsageLimitHeaders applies the headers of a final usage-limit error after
+// any passthrough headers, so they win: X-Should-Retry: false, Codex rate-limit
+// headers when the exhausted window is known, and no Retry-After, which would
+// make a client sleep through the window instead of stopping. It reports
+// whether err is a final usage limit.
+func WriteUsageLimitHeaders(dst http.Header, err error) bool {
+	if dst == nil {
+		return false
+	}
+	headers, ok := coreauth.UsageLimitResponseHeaders(err)
+	if !ok {
+		return false
+	}
+	dst.Del("Retry-After")
+	for key, values := range headers {
+		if http.CanonicalHeaderKey(key) == "Content-Type" {
+			continue
+		}
+		dst.Del(key)
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+	return true
 }
 
 func writeDirectErrorResponse(c *gin.Context, status int, msg *interfaces.ErrorMessage) {

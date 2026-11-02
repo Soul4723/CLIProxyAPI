@@ -81,6 +81,13 @@ type Result struct {
 	RetryAfter *time.Duration
 	// CredentialScope indicates that the failure affects the whole credential across models (e.g. Anthropic 5h/7d unified limits).
 	CredentialScope bool
+	// QuotaExhausted reports that the upstream explicitly identified this 429
+	// as quota exhaustion (see cliproxyexecutor.QuotaExhaustedError). Together
+	// with RetryAfter it is recorded as evidence for the cooldown it sets.
+	QuotaExhausted bool
+	// QuotaLimitWindowMinutes is the exhausted window length the upstream
+	// named, or 0 when unknown.
+	QuotaLimitWindowMinutes int64
 	// Error describes the failure when Success is false.
 	Error *Error
 	// Options carries execution request options (headers, metadata, etc.) for result tracking.

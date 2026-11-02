@@ -1180,6 +1180,11 @@ type statusErr struct {
 	credentialScoped   bool
 	streamTruncated    bool
 	transientRateLimit bool
+	// quotaExhausted marks a 429 the upstream explicitly identified as quota
+	// exhaustion with a structured code; quotaWindowMinutes is the length of
+	// the exhausted window when the upstream names it (0 when unknown).
+	quotaExhausted     bool
+	quotaWindowMinutes int64
 	// diagnostic is a content-free detail for logs only; it never reaches clients.
 	diagnostic string
 }
@@ -1205,14 +1210,40 @@ func (e statusErr) IsStreamTruncated() bool { return e.streamTruncated }
 // that must not be recorded as credential quota exhaustion.
 func (e statusErr) IsTransientRateLimit() bool { return e.transientRateLimit }
 
+// IsQuotaExhausted marks a 429 that the upstream explicitly identified as
+// quota exhaustion with a structured code.
+func (e statusErr) IsQuotaExhausted() bool { return e.quotaExhausted }
+
+// QuotaLimitWindowMinutes reports the length of the exhausted quota window
+// named by the upstream, or 0 when it is unknown.
+func (e statusErr) QuotaLimitWindowMinutes() int64 {
+	if !e.quotaExhausted {
+		return 0
+	}
+	return e.quotaWindowMinutes
+}
+
 const openAICompatTPMFallbackRetryAfter = time.Minute
 
 func newOpenAICompatStatusError(status int, headers http.Header, body []byte) statusErr {
 	return statusErr{
-		code:       status,
-		msg:        string(body),
-		retryAfter: openAICompatRetryAfter(status, headers, body, time.Now()),
+		code:           status,
+		msg:            string(body),
+		retryAfter:     openAICompatRetryAfter(status, headers, body, time.Now()),
+		quotaExhausted: status == http.StatusTooManyRequests && isOpenAIInsufficientQuotaError(body),
 	}
+}
+
+// isOpenAIInsufficientQuotaError reports whether body is an OpenAI
+// insufficient_quota error: the account's billing quota is exhausted, which a
+// retry does not fix.
+func isOpenAIInsufficientQuotaError(body []byte) bool {
+	for _, path := range []string{"error.code", "error.type"} {
+		if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, path).String()), "insufficient_quota") {
+			return true
+		}
+	}
+	return false
 }
 
 // openAICompatRetryAfter preserves the provider's standard Retry-After signal.

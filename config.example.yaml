@@ -234,6 +234,17 @@ routing:
     # Set to 0 to keep the legacy 60-second cooldown; set to -1 to disable transient error cooldowns.
     transient-error-cooldown-seconds: 0
 
+    # How to answer a request when every eligible credential is out of quota.
+    # retryable (default): a retryable 429 with Retry-After, as before.
+    # usage-limit: a final usage limit (429, X-Should-Retry: false, no Retry-After,
+    # error type usage_limit_reached with resets_at) so clients such as Codex and
+    # Claude Code stop and resume at the reset instead of retrying. It applies only
+    # when every candidate credential was refused with explicit upstream quota
+    # exhaustion (Codex usage_limit_reached, OpenAI insufficient_quota, Google
+    # QUOTA_EXHAUSTED, Anthropic unified 5h/7d rejection) and the earliest reset is
+    # more than 5 minutes away; every other case keeps the retryable answer.
+    quota-response-mode: retryable
+
 # Shared request/response behavior.
 requests:
   # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/

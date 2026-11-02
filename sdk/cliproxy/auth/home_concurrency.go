@@ -281,6 +281,11 @@ func verifyAccountedHomeConcurrencyIdentity(tuple homeConcurrencyTuple, auth *Au
 // SafeResponseHeaders returns trusted response headers only for concrete
 // retry/cooldown errors.
 func SafeResponseHeaders(err error) http.Header {
+	// A final usage limit owns the response headers: no Retry-After from a
+	// trusted annotation deeper in its cause chain may replace it.
+	if headers, ok := UsageLimitResponseHeaders(err); ok {
+		return headers
+	}
 	// An exhausted Home round owns the aggregated multi-credential deadline;
 	// a per-attempt trusted annotation deeper in the chain must not replace it.
 	var exhausted *homeRetryRoundExhaustedError

@@ -813,15 +813,29 @@ func classifyClaudeUpstreamErrorWithCooling(statusCode int, headers http.Header,
 	}
 	err := statusErr{code: statusCode, msg: string(body), retryAfter: retryAfter}
 	if statusCode == http.StatusTooManyRequests {
-		if !modelLevelCooling && helps.ClaudeHeadersIndicateUnifiedRateLimitRejection(headers) {
-			return claudeRateLimitError{statusErr: err, credentialScoped: true}
+		unifiedRejection := helps.ClaudeHeadersIndicateUnifiedRateLimitRejection(headers)
+		if !modelLevelCooling && unifiedRejection {
+			return claudeRateLimitError{statusErr: withClaudeUnifiedQuotaEvidence(err, headers), credentialScoped: true}
 		}
 		if claudeBodyIndicatesFastModeCredits(body) {
 			return claudeEntitlementError{err}
 		}
+		if unifiedRejection {
+			// Model-level cooling keeps the unified rejection on the model, but
+			// it is still explicit quota exhaustion evidence.
+			err = withClaudeUnifiedQuotaEvidence(err, headers)
+		}
 		// Ordinary model-level Claude 429 (not a unified 5h/7d rejection)
 		return claudeRateLimitError{statusErr: err, credentialScoped: false}
 	}
+	return err
+}
+
+// withClaudeUnifiedQuotaEvidence marks an explicit unified 5h/7d rejection as
+// quota exhaustion evidence and records the rejected window when known.
+func withClaudeUnifiedQuotaEvidence(err statusErr, headers http.Header) statusErr {
+	err.quotaExhausted = true
+	err.quotaWindowMinutes = helps.ClaudeRejectedWindowMinutes(headers)
 	return err
 }
 
