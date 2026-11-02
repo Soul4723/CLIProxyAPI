@@ -88,6 +88,10 @@ type Result struct {
 	// QuotaLimitWindowMinutes is the exhausted window length the upstream
 	// named, or 0 when unknown.
 	QuotaLimitWindowMinutes int64
+	// QuotaResetAfter is when explicitly exhausted quota returns, for errors
+	// that carry no retry hint (see cliproxyexecutor.QuotaResetError). It sets
+	// the cooldown only in the usage-limit response mode.
+	QuotaResetAfter *time.Duration
 	// Error describes the failure when Success is false.
 	Error *Error
 	// Options carries execution request options (headers, metadata, etc.) for result tracking.

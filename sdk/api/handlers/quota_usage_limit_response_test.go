@@ -34,6 +34,7 @@ type quotaRefusal struct {
 	exhausted  bool
 	window     int64
 	headers    http.Header
+	quotaReset *time.Duration
 }
 
 func (e quotaRefusal) Error() string              { return e.body }
@@ -43,8 +44,9 @@ func (e quotaRefusal) IsQuotaExhausted() bool     { return e.exhausted }
 func (e quotaRefusal) QuotaLimitWindowMinutes() int64 {
 	return e.window
 }
-func (e quotaRefusal) IsCredentialScoped() bool { return true }
-func (e quotaRefusal) Headers() http.Header     { return e.headers.Clone() }
+func (e quotaRefusal) IsCredentialScoped() bool        { return true }
+func (e quotaRefusal) QuotaResetAfter() *time.Duration { return e.quotaReset }
+func (e quotaRefusal) Headers() http.Header            { return e.headers.Clone() }
 
 func durationPtr(d time.Duration) *time.Duration { return &d }
 
@@ -365,4 +367,32 @@ func TestQuotaCooldownResponseModeSwitchAppliesToExistingCooldowns(t *testing.T)
 	assertUsageLimitResponse(t, surface, h.do(surface, true), 2*time.Hour, 300)
 	coreauth.SetQuotaCooldownResponseMode("retryable")
 	assertRetryableResponse(t, surface, h.do(surface, true), true)
+}
+
+// googleQuotaExhausted mirrors a Gemini or Vertex QUOTA_EXHAUSTED 429: explicit
+// evidence and a reset, but no retry hint on the error.
+func googleQuotaExhausted(reset time.Duration) quotaRefusal {
+	return quotaRefusal{
+		body:       `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"Quota exhausted"}}`,
+		exhausted:  true,
+		quotaReset: durationPtr(reset),
+	}
+}
+
+func TestQuotaResetWithoutRetryHintReportsUsageLimitOnlyInUsageLimitMode(t *testing.T) {
+	for _, surface := range quotaSurfaces {
+		t.Run("usage-limit/"+surface.name, func(t *testing.T) {
+			h := newQuotaHarness(t, "usage-limit", []quotaRefusal{googleQuotaExhausted(2 * time.Hour)})
+			assertUsageLimitResponse(t, surface, h.do(surface, true), 2*time.Hour, 0)
+			assertUsageLimitResponse(t, surface, h.do(surface, true), 2*time.Hour, 0)
+		})
+		t.Run("retryable/"+surface.name, func(t *testing.T) {
+			h := newQuotaHarness(t, "retryable", []quotaRefusal{googleQuotaExhausted(2 * time.Hour)})
+			recorder := h.do(surface, true)
+			assertRetryableResponse(t, surface, recorder, false)
+			if got := recorder.Header().Get("Retry-After"); got != "" {
+				t.Fatalf("default mode gained Retry-After = %q", got)
+			}
+		})
+	}
 }

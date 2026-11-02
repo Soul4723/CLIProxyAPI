@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"time"
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
@@ -329,6 +330,15 @@ type TransientRateLimitError interface {
 type QuotaExhaustedError interface {
 	error
 	IsQuotaExhausted() bool
+}
+
+// QuotaResetError optionally reports when the quota a QuotaExhaustedError
+// exhausted returns, for upstreams whose error does not otherwise carry a
+// retry hint. Auth managers use it as the cooldown deadline only in the
+// usage-limit response mode, so the default mode keeps its existing cooldown.
+type QuotaResetError interface {
+	error
+	QuotaResetAfter() *time.Duration
 }
 
 // QuotaLimitWindowError optionally reports the length, in minutes, of the

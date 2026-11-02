@@ -1185,6 +1185,9 @@ type statusErr struct {
 	// the exhausted window when the upstream names it (0 when unknown).
 	quotaExhausted     bool
 	quotaWindowMinutes int64
+	// quotaResetAfter is the provider reset of an explicit quota exhaustion
+	// that is not also the retry hint (see cliproxyexecutor.QuotaResetError).
+	quotaResetAfter *time.Duration
 	// diagnostic is a content-free detail for logs only; it never reaches clients.
 	diagnostic string
 }
@@ -1213,6 +1216,15 @@ func (e statusErr) IsTransientRateLimit() bool { return e.transientRateLimit }
 // IsQuotaExhausted marks a 429 that the upstream explicitly identified as
 // quota exhaustion with a structured code.
 func (e statusErr) IsQuotaExhausted() bool { return e.quotaExhausted }
+
+// QuotaResetAfter reports when an explicitly exhausted quota returns, for
+// errors that carry no retry hint of their own.
+func (e statusErr) QuotaResetAfter() *time.Duration {
+	if !e.quotaExhausted {
+		return nil
+	}
+	return e.quotaResetAfter
+}
 
 // QuotaLimitWindowMinutes reports the length of the exhausted quota window
 // named by the upstream, or 0 when it is unknown.

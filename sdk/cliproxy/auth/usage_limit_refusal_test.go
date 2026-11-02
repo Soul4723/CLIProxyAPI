@@ -230,3 +230,43 @@ func TestSetQuotaCooldownResponseMode(t *testing.T) {
 		}
 	}
 }
+
+type quotaResetOnlyErr struct{}
+
+func (quotaResetOnlyErr) Error() string                   { return "quota exhausted" }
+func (quotaResetOnlyErr) StatusCode() int                 { return http.StatusTooManyRequests }
+func (quotaResetOnlyErr) IsQuotaExhausted() bool          { return true }
+func (quotaResetOnlyErr) QuotaResetAfter() *time.Duration { d := 2 * time.Hour; return &d }
+
+// A quota reset reported apart from the retry hint (Gemini and Vertex) sets
+// the cooldown only in the usage-limit mode; the default keeps its backoff.
+func TestQuotaResetWithoutRetryHintAppliesOnlyInUsageLimitMode(t *testing.T) {
+	t.Cleanup(func() { SetQuotaCooldownResponseMode("") })
+	for _, mode := range []string{"retryable", "usage-limit"} {
+		t.Run(mode, func(t *testing.T) {
+			SetQuotaCooldownResponseMode(mode)
+			manager := NewManager(nil, nil, nil)
+			if _, err := manager.Register(WithSkipPersist(context.Background()), &Auth{ID: "auth-reset", Provider: "gemini", Status: StatusActive}); err != nil {
+				t.Fatal(err)
+			}
+			result := Result{AuthID: "auth-reset", Provider: "gemini", Model: "gemini-2.5-pro", Error: &Error{Message: "quota exhausted", HTTPStatus: http.StatusTooManyRequests}}
+			result.attachQuotaEvidence(quotaResetOnlyErr{})
+			if result.RetryAfter != nil {
+				t.Fatalf("attachQuotaEvidence set RetryAfter = %v", *result.RetryAfter)
+			}
+			manager.MarkResult(context.Background(), result)
+			got, _ := manager.GetByID("auth-reset")
+			state := got.ModelStates["gemini-2.5-pro"]
+			wait := time.Until(state.NextRetryAfter)
+			if mode == "retryable" {
+				if state.Quota.Exhausted || wait > time.Hour {
+					t.Fatalf("default mode changed: exhausted=%t cooldown=%v", state.Quota.Exhausted, wait)
+				}
+				return
+			}
+			if !state.Quota.Exhausted || wait < 2*time.Hour-time.Minute || wait > 2*time.Hour+time.Minute {
+				t.Fatalf("usage-limit mode: exhausted=%t cooldown=%v, want evidence and about 2h", state.Quota.Exhausted, wait)
+			}
+		})
+	}
+}

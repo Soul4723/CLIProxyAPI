@@ -911,6 +911,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
 		return
 	}
+	result = applyUsageLimitQuotaReset(result)
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -2102,6 +2103,29 @@ func (r *Result) attachQuotaEvidence(err error) {
 		return
 	}
 	r.QuotaExhausted, r.QuotaLimitWindowMinutes = quotaEvidenceFromError(err)
+	r.QuotaResetAfter = nil
+	if !r.QuotaExhausted {
+		return
+	}
+	if resetErr, ok := errors.AsType[cliproxyexecutor.QuotaResetError](err); ok && resetErr != nil {
+		if reset := resetErr.QuotaResetAfter(); reset != nil && *reset > 0 {
+			value := *reset
+			r.QuotaResetAfter = &value
+		}
+	}
+}
+
+// applyUsageLimitQuotaReset lets a quota reset reported apart from the retry
+// hint set the cooldown deadline, only in the usage-limit response mode: that
+// mode must know when quota returns, while the default mode keeps the cooldown
+// it always had for such errors.
+func applyUsageLimitQuotaReset(result Result) Result {
+	if result.RetryAfter != nil || !result.QuotaExhausted || result.QuotaResetAfter == nil || !QuotaCooldownUsageLimitModeEnabled() {
+		return result
+	}
+	reset := *result.QuotaResetAfter
+	result.RetryAfter = &reset
+	return result
 }
 
 // quotaEvidenceFromResult reports the quota-exhaustion evidence a failed
