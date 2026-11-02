@@ -227,6 +227,14 @@ func TestStreamPayloadIsQuotaFailure(t *testing.T) {
 		`{"type":"error","error":{"type":"usage_limit_reached","status":400,"message":"x"}}`:                   false,
 		`{"type":"error","status":429,"error":{"type":"invalid_request_error","message":"too many requests"}}`: true,
 		`{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"slow down"}}}`: true,
+		// Numeric strings count as statuses, as ojson Int() reads them in the
+		// executors.
+		`{"type":"error","status":"400","error":{"type":"rate_limit_error","message":"correct request"}}`:    false,
+		`{"type":"error","status_code":"503","error":{"type":"insufficient_quota","message":"x"}}`:           false,
+		`{"type":"error","error":{"type":"rate_limit_error","status":"400","message":"x"}}`:                  false,
+		`{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","status_code":"400"}}}`: false,
+		`{"type":"error","status":"429","error":{"type":"invalid_request_error","message":"x"}}`:             true,
+		`{"type":"error","error":{"type":"invalid_request_error","status_code":"429","message":"x"}}`:        true,
 	}
 	for payload, want := range cases {
 		if got := streamPayloadIsQuotaFailure([]byte(payload)); got != want {

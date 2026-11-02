@@ -278,17 +278,23 @@ func runRealCodexRecoverableError(t *testing.T, mode string, failure string) ([]
 // names a rate limit. It is forwarded at once in both modes, not held for an
 // error chunk that never comes.
 func TestRealCodexDuplexRecoverableErrorNotHeld(t *testing.T) {
-	failure := `{"type":"error","status":400,"error":{"type":"rate_limit_error","message":"correct this request"}}`
-	for _, mode := range []string{"retryable", "usage-limit"} {
-		t.Run(mode, func(t *testing.T) {
-			payload, errRead := runRealCodexRecoverableError(t, mode, failure)
-			if errRead != nil {
-				t.Fatalf("recoverable error was not forwarded while the upstream waits: %v", errRead)
-			}
-			if string(payload) != failure {
-				t.Fatalf("frame = %s, want the upstream error unchanged", payload)
-			}
-		})
+	failures := map[string]string{
+		"numeric-status": `{"type":"error","status":400,"error":{"type":"rate_limit_error","message":"correct this request"}}`,
+		// The executor reads "400" as 400 too.
+		"string-status": `{"type":"error","status":"400","error":{"type":"rate_limit_error","message":"correct request"}}`,
+	}
+	for name, failure := range failures {
+		for _, mode := range []string{"retryable", "usage-limit"} {
+			t.Run(name+"/"+mode, func(t *testing.T) {
+				payload, errRead := runRealCodexRecoverableError(t, mode, failure)
+				if errRead != nil {
+					t.Fatalf("recoverable error was not forwarded while the upstream waits: %v", errRead)
+				}
+				if string(payload) != failure {
+					t.Fatalf("frame = %s, want the upstream error unchanged", payload)
+				}
+			})
+		}
 	}
 }
 

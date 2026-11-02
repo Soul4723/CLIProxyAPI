@@ -180,18 +180,19 @@ func withoutQuotaFailureEvents(payload []byte) []byte {
 	return out
 }
 
-// streamFailureStatus reports the HTTP status a failure event names, in the
-// order the Codex executors read it: the event's own status or status_code,
-// then the error's status_code or status. A numeric error.code (Google's
-// error shape) counts too.
+// streamFailureStatus reports the HTTP status a failure event names, read
+// exactly as the Codex executors read it, with ojson Int(), so a numeric string
+// such as "400" counts: the event's own status or status_code when positive,
+// then the error's status_code or status within 400-599. A numeric error.code
+// (Google's error shape) in that range counts too.
 func streamFailureStatus(root, errorNode ojson.Result) (int, bool) {
 	for _, value := range []ojson.Result{root.Get("status"), root.Get("status_code")} {
-		if value.Type == ojson.Number && value.Int() > 0 {
-			return int(value.Int()), true
+		if status := value.Int(); status > 0 {
+			return int(status), true
 		}
 	}
 	for _, value := range []ojson.Result{errorNode.Get("status_code"), errorNode.Get("status"), errorNode.Get("code")} {
-		if status := value.Int(); value.Type == ojson.Number && status >= 400 && status <= 599 {
+		if status := value.Int(); status >= 400 && status <= 599 {
 			return int(status), true
 		}
 	}
