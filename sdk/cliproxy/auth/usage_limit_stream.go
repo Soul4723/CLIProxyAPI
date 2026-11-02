@@ -20,8 +20,9 @@ import (
 //
 // An upstream quota failure frame that the executor forwards right before its
 // error chunk (Codex duplex streams do this) is held back until that chunk
-// arrives. If the usage limit replaces the error, the frame is dropped so the
-// client gets one terminal error, not two; otherwise it is sent unchanged.
+// arrives. If the usage limit replaces the error, the quota event is removed
+// from that chunk so the client gets one terminal error, not two, and any other
+// events in the chunk are still sent; otherwise the chunk is sent unchanged.
 //
 // In the retryable mode, and under Home, the stream is returned as is.
 func (m *Manager) withStreamUsageLimit(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, result *cliproxyexecutor.StreamResult) *cliproxyexecutor.StreamResult {
@@ -49,7 +50,15 @@ func (m *Manager) withStreamUsageLimit(ctx context.Context, providers []string, 
 			if chunk.Err != nil {
 				if usageLimitErr := m.usageLimitResponseError(ctx, providers, model, opts, chunk.Err); usageLimitErr != nil {
 					chunk.Err = usageLimitErr
-					held = nil
+					if held != nil {
+						// Drop only the quota event; other events coalesced
+						// into the same chunk are still sent.
+						if rest := withoutQuotaFailureEvents(held.Payload); len(rest) > 0 {
+							held.Payload = rest
+						} else {
+							held = nil
+						}
+					}
 				}
 			}
 			if held != nil {
@@ -137,4 +146,35 @@ func streamFailureErrorNode(root ojson.Result, eventType string) (ojson.Result, 
 		}
 	}
 	return ojson.Result{}, false
+}
+
+// withoutQuotaFailureEvents returns payload without its quota failure events. A
+// raw JSON payload is one event; an SSE payload is split at blank lines and the
+// other events keep their exact bytes.
+func withoutQuotaFailureEvents(payload []byte) []byte {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		if streamPayloadIsQuotaFailure(trimmed) {
+			return nil
+		}
+		return payload
+	}
+	var out, event []byte
+	flush := func() {
+		if len(event) > 0 && !streamPayloadIsQuotaFailure(event) {
+			out = append(out, event...)
+		}
+		event = event[:0:0]
+	}
+	for _, line := range bytes.SplitAfter(payload, []byte("\n")) {
+		event = append(event, line...)
+		if len(bytes.TrimSpace(line)) == 0 {
+			flush()
+		}
+	}
+	flush()
+	if len(bytes.TrimSpace(out)) == 0 {
+		return nil
+	}
+	return out
 }
