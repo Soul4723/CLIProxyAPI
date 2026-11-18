@@ -9,15 +9,15 @@ package openai
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"sort"
 	"strings"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
+	"github.com/MoeForge/moego/regexp"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/optimize-multi-agent-v2"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
@@ -25,6 +25,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/httpwire"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
@@ -307,7 +308,7 @@ func (f *responsesSSEFramer) repairFrame(frame []byte) []byte {
 
 	f.dataFrames++
 
-	if responsesSSEErrorEvent(payloadType) || responsesSSEPayloadHasError(payload) {
+	if responsesSSEErrorEvent(payloadType) || responsesSSEPayloadHasErrorForEvent(streamEvent, payload) {
 		if payloadType != "" {
 			f.lastEvent = sanitizeResponsesStreamEventName(payloadType)
 		}
@@ -343,16 +344,88 @@ func (f *responsesSSEFramer) repairFrame(frame []byte) []byte {
 
 func responsesSSEPayloadErrorMessage(payload []byte) *interfaces.ErrorMessage {
 	status := http.StatusBadGateway
-	var candidatesBuf [6]ojson.Result
-	candidates := ojson.GetManyBytesNoCopy(candidatesBuf[:0], payload, "status", "status_code", "error.status", "error.status_code", "response.error.status", "response.error.status_code")
+	var candidatesBuf [10]ojson.Result
+	candidates := ojson.GetManyBytesNoCopy(candidatesBuf[:0], payload, "status", "status_code", "error.status", "error.status_code", "response.error.status", "response.error.status_code", "body.status", "body.status_code", "body.error.status", "body.error.status_code")
+	foundStatus := false
 	for _, res := range candidates {
 		candidate := int(res.Int())
 		if candidate >= http.StatusBadRequest && candidate <= 599 {
 			status = candidate
+			foundStatus = true
 			break
 		}
 	}
-	return sanitizeResponsesStreamErrorMessage(&interfaces.ErrorMessage{StatusCode: status, Error: fmt.Errorf("%s", payload)})
+	if !foundStatus {
+		status = responsesSSEPayloadErrorStatus(payload)
+	}
+	errPayload := responsesAnnotateImageGenerationComplexityPayload(payload)
+	return sanitizeResponsesStreamErrorMessage(&interfaces.ErrorMessage{StatusCode: status, Error: fmt.Errorf("%s", errPayload)})
+}
+
+func responsesAnnotateImageGenerationComplexityPayload(payload []byte) []byte {
+	if len(payload) == 0 || !ojson.ValidBytes(payload) {
+		return payload
+	}
+	for _, basePath := range []string{"error", "response.error"} {
+		errObj := ojson.GetBytesNoCopy(payload, basePath)
+		if !errObj.IsObject() {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(errObj.Get("type").String()), "image_generation_user_error") {
+			continue
+		}
+		msg := strings.TrimSpace(errObj.Get("message").String())
+		param := strings.ToLower(strings.TrimSpace(errObj.Get("param").String()))
+		if (param == "complexity" || strings.Contains(strings.ToLower(msg), "complexity")) && !strings.Contains(msg, "/v1/images/generations") {
+			doc := ojson.NewDoc(payload)
+			_ = doc.Set(basePath+".message", msg+` (Set tool_choice to {"type":"image_generation"}, use a compatible Responses model such as gpt-5.4-mini, or call /v1/images/generations directly.)`)
+			return doc.Bytes()
+		}
+	}
+	return payload
+}
+
+func responsesSSEPayloadErrorStatus(payload []byte) int {
+	var fieldsBuf [8]ojson.Result
+	fields := ojson.GetManyBytesNoCopy(fieldsBuf[:0], payload, "error.type", "response.error.type", "body.error.type", "type", "error.code", "response.error.code", "body.error.code", "code")
+	errorType := ""
+	for _, f := range fields[:4] {
+		candidate := strings.ToLower(strings.TrimSpace(f.String()))
+		if candidate != "" && candidate != "error" && candidate != "response.failed" && candidate != "response.error" {
+			errorType = candidate
+			break
+		}
+	}
+	errorCode := ""
+	for _, f := range fields[4:] {
+		candidate := strings.ToLower(strings.TrimSpace(f.String()))
+		if candidate != "" {
+			errorCode = candidate
+			break
+		}
+	}
+	switch {
+	case errorCode == "cyber_policy",
+		errorCode == "cyber_policy_violation",
+		errorCode == "bio_policy",
+		errorCode == "misalignment_policy_violation",
+		errorCode == "invalid_prompt",
+		errorCode == "content_policy_violation",
+		errorCode == "image_content_policy_violation":
+		return http.StatusBadRequest
+	case errorType == "not_found_error", errorCode == "not_found", errorCode == "model_not_found":
+		return http.StatusNotFound
+	case errorType == "authentication_error", errorCode == "invalid_api_key", errorCode == "unauthorized":
+		return http.StatusUnauthorized
+	case errorType == "permission_error", errorCode == "forbidden", errorCode == "permission_denied":
+		return http.StatusForbidden
+	case errorType == "rate_limit_error", errorCode == "rate_limit_exceeded":
+		return http.StatusTooManyRequests
+	case errorType == "invalid_request", errorType == "invalid_request_error", errorType == "bad_request_error", errorType == "image_generation_user_error", errorCode == "invalid_value", errorCode == "invalid_request_error":
+		return http.StatusBadRequest
+	default:
+		return http.StatusBadGateway
+	}
 }
 
 func (f *responsesSSEFramer) repairErrorPayload(payload []byte) []byte {
@@ -415,15 +488,46 @@ func responsesSSETerminalEvent(eventType string) bool {
 	}
 }
 
+func responsesSSETypeDenotesError(eventType string) bool {
+	trimmed := strings.ToLower(strings.TrimSpace(eventType))
+	if trimmed == "" {
+		return false
+	}
+	return responsesSSEErrorEvent(trimmed) ||
+		trimmed == "invalid_request" ||
+		strings.HasSuffix(trimmed, "_error") ||
+		strings.HasSuffix(trimmed, ".error")
+}
+
+func responsesSSECanInferBodyError(streamEvent, payloadType string) bool {
+	if s := strings.TrimSpace(streamEvent); s != "" && !responsesSSETypeDenotesError(s) {
+		return false
+	}
+	if p := strings.TrimSpace(payloadType); p != "" && !responsesSSETypeDenotesError(p) {
+		return false
+	}
+	return true
+}
+
 func responsesSSEPayloadHasError(payload []byte) bool {
-	var fieldsBuf [4]ojson.Result
-	fields := ojson.GetManyBytesNoCopy(fieldsBuf[:0], payload, "error", "response.error", "code", "message")
+	return responsesSSEPayloadHasErrorForEvent("", payload)
+}
+
+func responsesSSEPayloadHasErrorForEvent(streamEvent string, payload []byte) bool {
+	var fieldsBuf [6]ojson.Result
+	fields := ojson.GetManyBytesNoCopy(fieldsBuf[:0], payload, "error", "response.error", "body.error", "code", "message", "type")
 	for _, result := range fields[:2] {
 		if result.Exists() && result.Type != ojson.Null {
 			return true
 		}
 	}
-	return fields[2].Exists() && fields[3].Exists()
+	if fields[2].Exists() && fields[2].Type != ojson.Null {
+		if !(fields[2].Type == ojson.String && strings.TrimSpace(fields[2].String()) == "") &&
+			responsesSSECanInferBodyError(streamEvent, fields[5].String()) {
+			return true
+		}
+	}
+	return fields[3].Exists() && fields[4].Exists()
 }
 
 func responsesSSEDataPayload(frame []byte) ([]byte, bool) {
@@ -877,7 +981,8 @@ func (h *OpenAIResponsesAPIHandler) prepareCodexRequestPayload(c *gin.Context, p
 	doc := ojson.NewDoc(payload)
 	toolsChanged := h.prepareCodexMultiAgentV2ToolsDoc(c, doc)
 	orphanChanged := h.prepareCodexOrphanDelegationDoc(c, doc)
-	if len(payload) == 0 || (!toolsChanged && !orphanChanged) {
+	toolOutputChanged := translatorcommon.SanitizeOrphanResponsesToolOutputsDoc(doc)
+	if len(payload) == 0 || (!toolsChanged && !orphanChanged && !toolOutputChanged) {
 		return payload
 	}
 	return doc.Bytes()
@@ -928,6 +1033,7 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 
 	doc := ojson.NewDoc(rawJSON)
 	orphanChanged := h.prepareCodexOrphanDelegationDoc(c, doc)
+	toolOutputChanged := translatorcommon.SanitizeOrphanResponsesToolOutputsDoc(doc)
 
 	streamResult := doc.Get("stream")
 	if streamResult.Type == ojson.True {
@@ -944,7 +1050,7 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 		_ = doc.Delete("stream")
 		streamDeleted = true
 	}
-	if orphanChanged || streamDeleted {
+	if orphanChanged || toolOutputChanged || streamDeleted {
 		rawJSON = doc.Bytes()
 	}
 
@@ -1057,6 +1163,8 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		return
 	}
 	upstreamHeaders = resolvedHeaders
+	waitKeepAliveC, canWriteWaitKeepAlive, stopWaitKeepAlive := h.StartContinuityWaitKeepAliveForPeek(c, keepAliveC)
+	defer stopWaitKeepAlive()
 
 	isCodexClient := isCodexResponsesClientRequest(c)
 	failureEvent := "error"
@@ -1081,6 +1189,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			framer.Flush(&initialOutput)
 			if committed || framer.dataFrames > 0 {
 				stopKeepAlive()
+				stopWaitKeepAlive()
 				safeErrMsg := sanitizeResponsesStreamErrorMessage(errMsg)
 				commitSSE()
 				if initialOutput.Len() > 0 {
@@ -1132,6 +1241,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 
 				if committed || framer.dataFrames > 0 {
 					stopKeepAlive()
+					stopWaitKeepAlive()
 					commitSSE()
 					if initialOutput.Len() > 0 {
 						if errWrite := writeResponsesSSEChunk(c.Writer, initialOutput.Bytes()); errWrite != nil {
@@ -1175,6 +1285,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			}
 
 			stopKeepAlive()
+			stopWaitKeepAlive()
 			commitSSE()
 			if errWrite := writeResponsesSSEChunk(c.Writer, initialOutput.Bytes()); errWrite != nil {
 				cliCancel(errWrite)
@@ -1192,6 +1303,10 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 
 			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
 			return
+		case <-waitKeepAliveC:
+			if canWriteWaitKeepAlive() && !writeKeepAlive() {
+				return
+			}
 		case <-keepAliveC:
 			if !writeKeepAlive() {
 				return
@@ -1306,6 +1421,11 @@ func responsesStreamErrorText(errMsg *interfaces.ErrorMessage, status int) strin
 	if !hasError {
 		if resp, ok := root["response"].(map[string]any); ok {
 			errorNode, hasError = resp["error"].(map[string]any)
+		}
+	}
+	if !hasError {
+		if bodyMap, ok := root["body"].(map[string]any); ok {
+			errorNode, hasError = bodyMap["error"].(map[string]any)
 		}
 	}
 
