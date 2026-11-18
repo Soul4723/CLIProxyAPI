@@ -125,19 +125,23 @@ func runRealCodexWebsocketTurnWithClose(t *testing.T, mode string, steering bool
 }
 
 // With steering off, the Codex executor reports a quota failure after
-// response.created on its upstream disconnect channel, and the socket closes at
-// once without an event (1006), in both modes, as on base. The usage limit
-// reaches the client on its next request instead; see
-// TestRealCodexWebsocketQuotaReachesClientOnReconnect.
-func TestRealCodexWebsocketMidStreamQuotaClosesSilently(t *testing.T) {
+// response.created on its upstream disconnect channel. As upstream exposes
+// terminal 429 frames, the client gets that one error frame, in both modes,
+// and the socket then closes. The upstream frame is forwarded as sent; the
+// usage-limit event is built when the next request is refused (see
+// TestRealCodexWebsocketQuotaReachesClientOnReconnect).
+func TestRealCodexWebsocketMidStreamQuotaForwardsTerminalFrame(t *testing.T) {
 	for _, mode := range []string{"retryable", "usage-limit"} {
 		for name, failure := range map[string]string{"direct": codexQuotaFrameDirect, "wrapped": codexQuotaFrameWrapped} {
 			t.Run(mode+"/"+name, func(t *testing.T) {
-				frames, closeErr := runRealCodexWebsocketTurnWithClose(t, mode, false, failure)
-				if len(frames) != 0 {
-					t.Fatalf("frames = %q, want a silent close", frames)
+				frames, _ := runRealCodexWebsocketTurnWithClose(t, mode, false, failure)
+				if len(frames) != 1 {
+					t.Fatalf("frames = %q, want exactly the terminal quota error frame", frames)
 				}
-				assertAbnormalClose(t, closeErr)
+				if ojson.GetBytes([]byte(frames[0]), "type").String() != "error" || ojson.GetBytes([]byte(frames[0]), "status").Int() != http.StatusTooManyRequests ||
+					ojson.GetBytes([]byte(frames[0]), "error.type").String() != "usage_limit_reached" {
+					t.Fatalf("frame = %s, want a 429 usage_limit_reached error frame", frames[0])
+				}
 			})
 		}
 	}
@@ -165,21 +169,28 @@ func TestRealCodexDuplexQuotaFrameSentOnce(t *testing.T) {
 	}
 }
 
-// Retryable mode keeps the base behaviour: a silent close without steering,
-// and the upstream frame alone with steering.
+// Retryable mode adds no usage-limit event: without steering the client gets the
+// terminal 429 error frame (see TestRealCodexWebsocketMidStreamQuotaForwardsTerminalFrame),
+// and with steering the upstream frame alone.
 func TestRealCodexWebsocketRetryableModeUnchanged(t *testing.T) {
 	for _, steering := range []bool{false, true} {
 		for name, failure := range map[string]string{"direct": codexQuotaFrameDirect, "wrapped": codexQuotaFrameWrapped} {
 			label := "steering-off/" + name
-			want := []string(nil)
 			if steering {
 				label = "steering-on/" + name
-				want = []string{failure}
 			}
 			t.Run(label, func(t *testing.T) {
 				frames, closeErr := runRealCodexWebsocketTurnWithClose(t, "retryable", steering, failure)
-				if strings.Join(frames, "\n") != strings.Join(want, "\n") {
-					t.Fatalf("frames = %q, want %q", frames, want)
+				if len(frames) != 1 {
+					t.Fatalf("frames = %q, want exactly one", frames)
+				}
+				if steering && frames[0] != failure {
+					t.Fatalf("frames = %q, want the upstream frame alone %q", frames, failure)
+				}
+				for _, marker := range []string{"headers.X-Should-Retry", "error.resets_at"} {
+					if ojson.Get(frames[0], marker).Exists() {
+						t.Fatalf("frame = %s, carries %s of a final usage limit", frames[0], marker)
+					}
 				}
 				assertAbnormalClose(t, closeErr)
 			})
@@ -409,7 +420,7 @@ func (b *blockedTurn) handlerExitsWithin(limit time.Duration) bool {
 
 // A client that stops reading during a large frame must not keep the handler
 // alive when the upstream then fails with exhausted quota: in both modes the
-// socket closes at once, as on base, and the handler exits.
+// handler exits and the socket closes, after at most the terminal 429 frame.
 func TestRealCodexWebsocketBlockedClientDoesNotHangHandler(t *testing.T) {
 	for _, mode := range []string{"retryable", "usage-limit"} {
 		t.Run(mode, func(t *testing.T) {
@@ -423,14 +434,28 @@ func TestRealCodexWebsocketBlockedClientDoesNotHangHandler(t *testing.T) {
 				t.Fatal("handler still blocked 3s after the upstream failed")
 			}
 			_ = turn.client.SetReadDeadline(time.Now().Add(5 * time.Second))
+			sawError := false
 			for {
 				_, payload, errRead := turn.client.ReadMessage()
 				if errRead != nil {
-					assertAbnormalClose(t, errRead)
+					var netErr net.Error
+					if errors.As(errRead, &netErr) && netErr.Timeout() {
+						t.Fatalf("websocket stayed open after the failure: %v", errRead)
+					}
 					return
 				}
-				if got := ojson.GetBytes(payload, "type").String(); got != "response.output_text.delta" {
-					t.Fatalf("frame type = %q, want only output before the silent close", got)
+				if sawError {
+					t.Fatalf("frame %s after the terminal quota error frame", payload)
+				}
+				switch got := ojson.GetBytes(payload, "type").String(); got {
+				case "response.output_text.delta":
+				case "error":
+					sawError = ojson.GetBytes(payload, "status").Int() == http.StatusTooManyRequests
+					if !sawError {
+						t.Fatalf("error frame = %s, want status 429", payload)
+					}
+				default:
+					t.Fatalf("frame type = %q, want only output and then the terminal quota error frame", got)
 				}
 			}
 		})
@@ -447,8 +472,8 @@ func assertAbnormalClose(t *testing.T, err error) {
 	}
 }
 
-// A quota failure mid-stream closes the socket silently. Codex then reconnects,
-// and its next request finds every credential cooling with quota evidence, so
+// A quota failure mid-stream ends the first connection with the terminal 429
+// frame. Codex then reconnects, and its next request finds every credential cooling with quota evidence, so
 // it gets exactly one usage-limit event, with the reset and the x-codex window
 // headers, before the socket closes. The upstream is not contacted again.
 func TestRealCodexWebsocketQuotaReachesClientOnReconnect(t *testing.T) {
@@ -519,10 +544,16 @@ func TestRealCodexWebsocketQuotaReachesClientOnReconnect(t *testing.T) {
 	}
 	close(releaseFailure)
 	_, payload, errRead := first.ReadMessage()
-	if errRead == nil {
-		t.Fatalf("first connection got %s after the quota failure, want a silent close", payload)
+	if errRead != nil {
+		t.Fatalf("first connection: %v, want the terminal quota error frame", errRead)
 	}
-	assertAbnormalClose(t, errRead)
+	if ojson.GetBytes(payload, "type").String() != "error" || ojson.GetBytes(payload, "status").Int() != http.StatusTooManyRequests ||
+		ojson.GetBytes(payload, "error.type").String() != "usage_limit_reached" {
+		t.Fatalf("first connection got %s after the quota failure, want a 429 usage_limit_reached error frame", payload)
+	}
+	if _, _, errClosed := first.ReadMessage(); errClosed == nil {
+		t.Fatal("first connection stayed open after the terminal quota error frame")
+	}
 
 	// The failure is recorded by the stream's result tracking; wait until the
 	// credential is cooling before reconnecting, as a reconnect would find it.

@@ -124,7 +124,8 @@ func TestStatusErrorsReportOnlyStructuredQuotaExhaustion(t *testing.T) {
 }
 
 // Gemini and Vertex report Google quota exhaustion on every request path
-// without changing the error text or retry hint the default mode uses.
+// without changing the error text or the retry hint the default mode uses
+// (the body's RetryInfo delay, as upstream's newGeminiStatusErr reads it).
 func TestGeminiAndVertexReportGoogleQuotaExhaustion(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
@@ -145,8 +146,12 @@ func TestGeminiAndVertexReportGoogleQuotaExhaustion(t *testing.T) {
 				_, err = exec.Execute(context.Background(), auth, req, opts)
 			}
 			hint, _ := err.(interface{ RetryAfter() *time.Duration })
-			if exhausted, _, reset := quotaEvidenceOf(err); !exhausted || reset != 2*time.Hour || err.Error() != googleQuotaExhaustedBody || (hint != nil && hint.RetryAfter() != nil) {
+			if exhausted, _, reset := quotaEvidenceOf(err); !exhausted || reset != 2*time.Hour || err.Error() != googleQuotaExhaustedBody {
 				t.Fatalf("%s stream=%t: err = %T %v, want QUOTA_EXHAUSTED evidence with a 2h reset and the error unchanged", provider, stream, err, err)
+			}
+			// The retry hint is the one upstream reads from the body (RetryInfo 7200s).
+			if hint == nil || hint.RetryAfter() == nil || *hint.RetryAfter() != 2*time.Hour {
+				t.Fatalf("%s stream=%t: retry hint = %v, want the 2h RetryInfo delay", provider, stream, hint)
 			}
 		}
 	}
