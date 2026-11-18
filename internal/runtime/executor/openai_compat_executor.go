@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -16,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -112,6 +112,20 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 
 func (e *OpenAICompatExecutor) executeWithCredentials(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseURL, apiKey string, compat *config.OpenAICompatibility) (resp cliproxyexecutor.Response, err error) {
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
+	if opts.SourceFormat == sdktranslator.FormatOpenAIResponse {
+		if opts.Alt == "responses/compact" {
+			if errExpand := helps.ExpandRecognizedResponsesCompactionCapsules(&req, &opts); errExpand != nil {
+				return resp, statusErr{code: http.StatusBadRequest, msg: errExpand.Error()}
+			}
+		} else {
+			if errExpand := helps.ExpandResponsesCompactionCapsules(&req, &opts, e.Identifier()); errExpand != nil {
+				return resp, statusErr{code: http.StatusBadRequest, msg: errExpand.Error()}
+			}
+			if helps.HasResponsesCompactionTriggerRequest(req, opts) {
+				return e.executeOpenAICompatResponsesCompaction(ctx, auth, req, opts, baseURL, apiKey, compat)
+			}
+		}
+	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -216,18 +230,21 @@ func (e *OpenAICompatExecutor) executeWithCredentials(ctx context.Context, auth 
 	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, errRead := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+		if errRead != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+		}
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = newOpenAICompatStatusError(httpResp.StatusCode, httpResp.Header, b)
 		return resp, err
 	}
 	body, err := io.ReadAll(httpResp.Body)
+	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
-	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
 	reporter.ObserveResponseModel(body)
 	// Ensure we at least record the request even if upstream doesn't return usage
 	// Translate response back to source format when needed
@@ -318,12 +335,12 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 
 	body, errRead := io.ReadAll(httpResp.Body)
+	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
 	if errRead != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
 		err = errRead
 		return resp, err
 	}
-	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), body))
@@ -350,6 +367,14 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 
 func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseURL, apiKey string, compat *config.OpenAICompatibility) (_ *cliproxyexecutor.StreamResult, err error) {
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
+	if opts.SourceFormat == sdktranslator.FormatOpenAIResponse && opts.Alt != "responses/compact" {
+		if errExpand := helps.ExpandResponsesCompactionCapsules(&req, &opts, e.Identifier()); errExpand != nil {
+			return nil, statusErr{code: http.StatusBadRequest, msg: errExpand.Error()}
+		}
+		if helps.HasResponsesCompactionTriggerRequest(req, opts) {
+			return e.executeOpenAICompatResponsesCompactionStream(ctx, auth, req, opts, baseURL, apiKey, compat)
+		}
+	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -448,8 +473,11 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
+		b, errRead := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+		if errRead != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+		}
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
@@ -737,11 +765,11 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
 		}
+		helps.AppendAPIResponseChunk(ctx, e.cfg, body)
 		if errRead != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
 			return nil, errRead
 		}
-		helps.AppendAPIResponseChunk(ctx, e.cfg, body)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), body))
 		// Only the quota evidence of the other paths: the retry hint stays as it was.
 		streamErr := statusErr{code: httpResp.StatusCode, msg: string(body)}
@@ -799,7 +827,63 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
 
+func (e *OpenAICompatExecutor) executeOpenAICompatResponsesCompaction(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseURL, apiKey string, compat *config.OpenAICompatibility) (cliproxyexecutor.Response, error) {
+	var resp cliproxyexecutor.Response
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	summaryPayload := helps.PrepareAntigravityCompactionSummaryPayload(helps.ResponsesCompactionSourcePayload(req, opts), baseModel)
+	summaryReq := req
+	summaryReq.Payload = summaryPayload
+	summaryOpts := opts
+	summaryOpts.Alt = ""
+	summaryOpts.Stream = false
+	summaryOpts.OriginalRequest = nil
+	summaryOpts.SourceFormat = sdktranslator.FormatOpenAIResponse
+	summaryOpts.ResponseFormat = sdktranslator.FormatOpenAIResponse
+
+	summaryResp, errSummary := e.executeWithCredentials(ctx, auth, summaryReq, summaryOpts, baseURL, apiKey, compat)
+	if errSummary != nil {
+		return resp, errSummary
+	}
+	respPayload, errBuild := helps.BuildResponsesCompactionResponseFromSummary(baseModel, summaryResp.Payload)
+	if errBuild != nil {
+		return resp, statusErr{code: http.StatusBadGateway, msg: errBuild.Error()}
+	}
+	return cliproxyexecutor.Response{
+		Payload: respPayload,
+		Headers: summaryResp.Headers,
+	}, nil
+}
+
+func (e *OpenAICompatExecutor) executeOpenAICompatResponsesCompactionStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseURL, apiKey string, compat *config.OpenAICompatibility) (*cliproxyexecutor.StreamResult, error) {
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	summaryResp, errSummary := e.executeOpenAICompatResponsesCompaction(ctx, auth, req, opts, baseURL, apiKey, compat)
+	if errSummary != nil {
+		return nil, errSummary
+	}
+	chunks, errChunks := helps.BuildResponsesCompactionStreamChunksFromResponse(baseModel, summaryResp.Payload)
+	if errChunks != nil {
+		return nil, statusErr{code: http.StatusBadGateway, msg: errChunks.Error()}
+	}
+	out := make(chan cliproxyexecutor.StreamChunk, len(chunks))
+	for _, chunk := range chunks {
+		out <- cliproxyexecutor.StreamChunk{Payload: chunk}
+	}
+	close(out)
+
+	headers := summaryResp.Headers.Clone()
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	headers.Set("Content-Type", "text/event-stream")
+	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}, nil
+}
+
 func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if opts.SourceFormat == sdktranslator.FormatOpenAIResponse && opts.Alt != "responses/compact" {
+		if errExpand := helps.ExpandResponsesCompactionCapsules(&req, &opts, e.Identifier()); errExpand != nil {
+			return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadRequest, msg: errExpand.Error()}
+		}
+	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	from := opts.SourceFormat
@@ -1209,6 +1293,10 @@ type statusErr struct {
 	quotaExhausted     bool
 	quotaWindowMinutes int64
 	quotaResetAfter    *time.Duration
+	transientTransport bool
+	tosViolation       bool
+	tosAppealURL       string
+	tosAppealURLText   string
 	// diagnostic is a content-free detail for logs only; it never reaches clients.
 	diagnostic string
 }
@@ -1239,6 +1327,60 @@ func (e statusErr) IsTransientRateLimit() bool { return e.transientRateLimit }
 func (e statusErr) IsQuotaExhausted() bool          { return e.quotaExhausted }
 func (e statusErr) QuotaLimitWindowMinutes() int64  { return e.quotaWindowMinutes }
 func (e statusErr) QuotaResetAfter() *time.Duration { return e.quotaResetAfter }
+
+// IsTerminalTOSViolation marks a 403 PERMISSION_DENIED carrying an ErrorInfo
+// reason=TOS_VIOLATION. The conductor must deactivate the credential rather
+// than cool it, so sibling credentials are not hammered during a sweep.
+func (e statusErr) IsTerminalTOSViolation() bool { return e.tosViolation }
+
+// TOSAppealMetadata exposes the operator-facing appeal detail extracted from
+// the ErrorInfo metadata so the conductor can persist it on the auth record.
+func (e statusErr) TOSAppealMetadata() map[string]string {
+	if !e.tosViolation || (e.tosAppealURL == "" && e.tosAppealURLText == "") {
+		return nil
+	}
+	meta := map[string]string{
+		"tos_appeal_url":      e.tosAppealURL,
+		"tos_appeal_url_text": e.tosAppealURLText,
+	}
+	return meta
+}
+
+// ErrorCode exposes the machine-readable classification for terminal TOS
+// violations or transient non-credential failures so MarkResult routes them
+// to the appropriate credential state handler.
+func (e statusErr) ErrorCode() string {
+	if e.tosViolation {
+		return "tos_violation"
+	}
+	if e.transientTransport {
+		return cliproxyauth.ErrorCodeTransientTransport
+	}
+	return ""
+}
+
+// newGeminiZeroOutputStatusErr builds a 502 error tagged with
+// ErrorCodeTransientTransport so Gemini-family zero-output failures allow
+// per-request rotation and failover without cooling healthy credentials.
+func newGeminiZeroOutputStatusErr(msg string) statusErr {
+	return statusErr{
+		code:               http.StatusBadGateway,
+		msg:                msg,
+		transientTransport: true,
+	}
+}
+
+// newGeminiTranslatedClaudeErrorStatusErr preserves ErrorCodeTransientTransport
+// when a translated Claude error payload originates from zero-output
+// MALFORMED_FUNCTION_CALL (for instance when groundingChunks bypassed the
+// executor zero-output guard), while leaving all other errors coolable.
+func newGeminiTranslatedClaudeErrorStatusErr(msg string) statusErr {
+	if strings.EqualFold(strings.TrimSpace(ojson.Get(msg, "type").String()), "error") &&
+		strings.Contains(ojson.Get(msg, "error.message").String(), "MALFORMED_FUNCTION_CALL") {
+		return newGeminiZeroOutputStatusErr(msg)
+	}
+	return statusErr{code: http.StatusBadGateway, msg: msg}
+}
 
 const openAICompatTPMFallbackRetryAfter = time.Minute
 

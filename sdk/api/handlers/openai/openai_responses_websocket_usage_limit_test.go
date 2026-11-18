@@ -68,9 +68,14 @@ func TestShouldExposeResponsesUsageLimit(t *testing.T) {
 	if !shouldExposeResponsesUpstreamError(&interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, Error: usageLimit}) {
 		t.Fatalf("usage limit is not exposed")
 	}
+	// A terminal 429 (a cooldown once credential failover is exhausted) is
+	// exposed too, as upstream does; transient transport failures stay silent.
 	cooldown := coreauth.NewModelCooldownError("gpt-6-astra", "codex", 3*time.Hour)
-	if shouldExposeResponsesUpstreamError(&interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, Error: cooldown}) {
-		t.Fatalf("retryable cooldown is exposed")
+	if !shouldExposeResponsesUpstreamError(&interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, Error: cooldown}) {
+		t.Fatalf("terminal cooldown is not exposed")
+	}
+	if shouldExposeResponsesUpstreamError(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New("upstream connection reset")}) {
+		t.Fatalf("transient transport failure is exposed")
 	}
 }
 
@@ -318,29 +323,40 @@ func TestResponsesWebsocketSendsUsageLimitAfterResponseStarted(t *testing.T) {
 	assertWebsocketUsageLimitEvent(t, frames[1])
 }
 
-// Retryable mode, and a pool that is only rate limited, keep the silent close.
-func TestResponsesWebsocketKeepsSilentCloseWithoutUsageLimit(t *testing.T) {
+// Retryable mode, and a pool that is only rate limited, report the terminal 429
+// as a plain error frame, as upstream does (a final usage limit alone carries the
+// usage-limit event's status headers and reset time).
+func TestResponsesWebsocketExposesTerminalQuotaWithoutUsageLimitEvent(t *testing.T) {
 	cases := []struct {
-		name string
-		turn websocketTurn
-		want int
+		name    string
+		turn    websocketTurn
+		created int
 	}{
 		{name: "retryable-already-cooling", turn: websocketTurn{mode: "retryable", exhausted: true, preCooled: true}},
 		{name: "retryable-refused-during-turn", turn: websocketTurn{mode: "retryable", exhausted: true}},
-		{name: "retryable-after-response-started", turn: websocketTurn{mode: "retryable", exhausted: true, midStream: true}, want: 1},
+		{name: "retryable-after-response-started", turn: websocketTurn{mode: "retryable", exhausted: true, midStream: true}, created: 1},
 		{name: "usage-limit-rate-limited-already-cooling", turn: websocketTurn{mode: "usage-limit", preCooled: true}},
 		{name: "usage-limit-rate-limited-during-turn", turn: websocketTurn{mode: "usage-limit"}},
-		{name: "usage-limit-rate-limited-after-response-started", turn: websocketTurn{mode: "usage-limit", midStream: true}, want: 1},
+		{name: "usage-limit-rate-limited-after-response-started", turn: websocketTurn{mode: "usage-limit", midStream: true}, created: 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			frames := runResponsesWebsocketTurn(t, tc.turn)
-			if len(frames) != tc.want {
-				t.Fatalf("frames = %q, want %d frame(s) and then a silent close", frames, tc.want)
+			if len(frames) != tc.created+1 {
+				t.Fatalf("frames = %q, want %d response.created frame(s) and one error frame", frames, tc.created)
 			}
-			for _, frame := range frames {
+			for _, frame := range frames[:tc.created] {
 				if got := ojson.GetBytes(frame, "type").String(); got != "response.created" {
-					t.Fatalf("frame type = %q, want only response.created: %s", got, frame)
+					t.Fatalf("frame type = %q, want response.created: %s", got, frame)
+				}
+			}
+			last := frames[len(frames)-1]
+			if ojson.GetBytes(last, "type").String() != "error" || ojson.GetBytes(last, "status").Int() != http.StatusTooManyRequests {
+				t.Fatalf("last frame = %s, want a 429 error frame", last)
+			}
+			for _, marker := range []string{"headers.X-Should-Retry", "headers.X-Codex-Primary-Used-Percent", "error.resets_at"} {
+				if ojson.GetBytes(last, marker).Exists() {
+					t.Fatalf("last frame = %s, carries %s of a final usage limit", last, marker)
 				}
 			}
 		})

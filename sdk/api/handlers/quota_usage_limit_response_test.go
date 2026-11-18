@@ -182,8 +182,11 @@ func assertUsageLimitResponse(t *testing.T, surface quotaSurface, recorder *http
 func assertRetryableResponse(t *testing.T, recorder *httptest.ResponseRecorder, alreadyCooling bool) {
 	t.Helper()
 	body, header := recorder.Body.Bytes(), recorder.Header()
+	// The cooldown message may end in "(reset after <duration>)" (upstream shows
+	// the retry time on cooldown errors); only a final usage limit has the
+	// resets_at time and retryable=false.
 	if recorder.Code != http.StatusTooManyRequests || header.Get("X-Should-Retry") != "" || header.Get("X-Codex-Primary-Used-Percent") != "" ||
-		ojson.GetBytes(body, "error.resets_at").Exists() || strings.Contains(string(body), "reset after") {
+		ojson.GetBytes(body, "error.resets_at").Exists() || ojson.GetBytes(body, "error.retryable").Exists() {
 		t.Fatalf("status=%d headers=%v body=%s, want the retryable answer", recorder.Code, header, body)
 	}
 	if isCooldown := strings.Contains(string(body), "are cooling down"); isCooldown != alreadyCooling {
